@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: interlink-agent
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/agent/health
+    envVars:
+      - key: AGENT_MAX_SESSIONS
+        value: "2"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: AGENT_ALLOWED_ORIGINS
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false

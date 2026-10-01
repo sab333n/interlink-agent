@@ -1,0 +1,11 @@
+.venv
+.env
+__pycache__
+.inline-sessions
+.agent-runs
+*.log
+*.png
+*.pdf
+*.txt
+!requirements.txt
+profile.json
