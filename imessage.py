@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 import chat
 from auth import auth_required, require_user
@@ -379,11 +380,47 @@ async def status(user: str = Depends(require_user)) -> dict[str, Any]:
     return {"enabled": True, "number": cfg["number"] if cfg else None, "linked_phone": await phone_for_user(user)}
 
 
+def e164(raw: str) -> Optional[str]:
+    digits = re.sub(r"\D", "", raw or "")
+    if raw.strip().startswith("+") and 8 <= len(digits) <= 15:
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
+
+
+async def add_contact(phone: str) -> None:
+    """Free Sendblue lines only reply to saved contacts, so add the user's phone for them."""
+    cfg = sendblue_config() or {}
+    try:
+        await http("POST", f"{SENDBLUE}/api/v2/contacts", _sb_headers(),
+                   {"number": phone, "sendblue_number": cfg.get("number"), "tags": ["interlink"],
+                    "update_if_exists": True})
+    except RuntimeError as e:
+        if "→ 409" in str(e):
+            return
+        log(f"add contact •••{phone[-4:]} failed: {e}")
+        if re.search(r"→ (400|402|403|429)", str(e)):
+            raise HTTPException(409, "InterLink's iMessage line is full right now. Try again later.") from None
+        raise HTTPException(502, "Couldn't reach iMessage right now. Try again in a minute.") from None
+
+
+class LinkRequest(BaseModel):
+    phone: str = ""
+
+
 @router.post("/link-code")
-async def link_code(user: str = Depends(require_user)) -> dict[str, Any]:
+async def link_code(body: LinkRequest = LinkRequest(), user: str = Depends(require_user)) -> dict[str, Any]:
     cfg = sendblue_config()
     if not enabled() or not cfg or user == "local":
         raise HTTPException(503, "iMessage isn't set up on this server.")
+    if body.phone:
+        phone = e164(body.phone)
+        if not phone:
+            raise HTTPException(400, "Enter a full phone number, like (555) 123-4567.")
+        await add_contact(phone)
     for k in [k for k, (u, t) in _codes.items() if u == user or time.time() - t > CODE_TTL]:
         del _codes[k]
     code = f"{random.SystemRandom().randrange(10 ** 6):06d}"
