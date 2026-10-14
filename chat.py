@@ -71,6 +71,11 @@ NEVER
   if you don't know, say so in one line. a bare "yes" or "ok" only answers your last question,
   it never confirms a fact (offers, interviews, applications) that isn't in CONTEXT
 
+ABOUT YOU
+- you run on gpt-oss-120b, an open-weight model from openai, served by groq. say that if asked.
+- you don't know other models' parameter counts or internals. say so instead of guessing
+- stay on their job search. only use draft_email when they ask to write to a specific person
+
 TOOLS (you act through these, you never pretend)
 - show_picks: show their best-matching open roles from CONTEXT, by pick number
 - find_work_email: look up someone's work email from a LinkedIn profile URL. be honest if it's a guess
@@ -168,7 +173,8 @@ async def run_tool(name: str, args: dict[str, Any], ctx: dict[str, Any]) -> tupl
         pick = picks[n - 1]
         if not pick.get("can_apply_in_app"):
             return f"{pick['company']} has no online form InterLink can fill.", []
-        return f"Opened the application for {pick['company']}.", [{"type": "apply", "job_id": pick["job_id"]}]
+        return (f"Started filling the {pick['company']} application. The user reviews it and confirms before "
+                "anything is sent; don't claim it's submitted."), [{"type": "apply", "job_id": pick["job_id"]}]
     if name == "draft_email":
         draft = {k: str(args.get(k, "")) for k in ("to", "to_name", "company", "subject", "body")}
         return "Draft shown to the user.", [{"type": "draft", "draft": draft}]

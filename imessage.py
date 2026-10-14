@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 import chat
+import inline_apply
 from auth import auth_required, require_user
 
 router = APIRouter(prefix="/api/imessage")
@@ -45,6 +46,8 @@ _codes: dict[str, tuple[str, float]] = {}
 _locks: dict[str, asyncio.Lock] = {}
 _nudged: dict[str, float] = {}
 _tasks: set[asyncio.Task[None]] = set()
+# user id → {"sid", "queue": field ids still to ask, "answers", "profile"} for an application in progress
+_applies: dict[str, dict[str, Any]] = {}
 
 
 def log(msg: str) -> None:
@@ -67,20 +70,22 @@ def enabled() -> bool:
     return bool(sendblue_config() and admin_config() and chat.llm_config())
 
 
-def _http(method: str, url: str, headers: dict[str, str], body: Any = None) -> Any:
+def _http(method: str, url: str, headers: dict[str, str], body: Any = None, raw: bool = False) -> Any:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={**headers, **({"Content-Type": "application/json"} if data else {})})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read()
+            content = r.read()
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"{method} {url.split('?')[0]} → {e.code}: {e.read()[:200]!r}") from None
-    return json.loads(raw) if raw.strip() else None
+    if raw:
+        return content
+    return json.loads(content) if content.strip() else None
 
 
-async def http(method: str, url: str, headers: dict[str, str], body: Any = None) -> Any:
-    return await asyncio.to_thread(_http, method, url, headers, body)
+async def http(method: str, url: str, headers: dict[str, str], body: Any = None, raw: bool = False) -> Any:
+    return await asyncio.to_thread(_http, method, url, headers, body, raw)
 
 
 # ---- Sendblue ---------------------------------------------------------------
@@ -171,6 +176,184 @@ async def save_chat(user_id: str, state: dict[str, Any]) -> None:
     }, prefer="resolution=merge-duplicates")
 
 
+async def download_resume(path: str) -> bytes:
+    base, _ = admin_config() or ("", "")
+    return await http("GET", f"{base}/storage/v1/object/resumes/{urllib.parse.quote(path)}", _db_headers(), raw=True)
+
+
+async def record_application(user_id: str, job: dict[str, Any]) -> None:
+    await db("POST", "applications?on_conflict=user_id,job_id",
+             {"user_id": user_id, "job_id": job["id"], "company": job["company"], "role": job["role"],
+              "stage": "applied"}, prefer="resolution=merge-duplicates")
+
+
+# ---- Applying by text -------------------------------------------------------
+
+def _spawn(coro: Any) -> None:
+    task = asyncio.create_task(coro)
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def _finish_link(job_id: str) -> str:
+    return f"{SITE_URL}/applicant/jobs?apply={urllib.parse.quote(job_id)}"
+
+
+async def run_apply(phone: str, user_id: str, job_id: str, snapshot: dict[str, Any]) -> None:
+    """Fills the employer's form in the server browser, then texts a summary and waits for "submit"."""
+    info = snapshot.get("apply") or {}
+    job = (info.get("jobs") or {}).get(job_id)
+    if not job or not job.get("apply_url"):
+        await send_text(phone, f"i can't fill that one from here. open it:\n{_finish_link(job_id)}")
+        return
+    if not info.get("resume_path"):
+        await send_text(phone, f"upload your resume first, then i can apply for you:\n{SITE_URL}/applicant/profile")
+        return
+    old = _applies.pop(user_id, None)
+    if old:
+        await inline_apply.close_session(old["sid"])
+    try:
+        resume = await download_resume(info["resume_path"])
+        s = await inline_apply.open_session(
+            {"id": job_id, "company": job["company"], "role": job["role"], "apply_url": job["apply_url"]},
+            info.get("profile") or {}, resume, info.get("resume_name"), user_id)
+    except HTTPException as e:
+        await send_text(phone, f"{str(e.detail).lower()}")
+        return
+    if s.task:
+        await s.task
+    name = f"{job['company']} – {job['role']}"
+    if s.status != "ready":
+        await inline_apply.close_session(s.id)
+        await send_text(phone, f"couldn't fill {job['company']} from here ({s.detail.lower() or s.status}). "
+                               f"finish it yourself:\n{job['apply_url']}")
+        return
+    queue = [f["id"] for f in s.fields
+             if f["required"] and f["kind"] != "file" and not str(f["value"]).strip()]
+    _applies[user_id] = {"sid": s.id, "queue": queue, "answers": {}, "profile": info.get("profile") or {}}
+    if queue:
+        await send_text(phone, f"filled the basics for {name}. {len(queue)} question"
+                               f"{'s' if len(queue) > 1 else ''} only you can answer - reply \"cancel\" anytime.")
+        await send_text(phone, ask_text(s, queue[0], 1, len(queue)))
+        return
+    await send_text(phone, ready_text(s, {}))
+
+
+def _field(s: Any, fid: str) -> dict[str, Any]:
+    return next(f for f in s.fields if f["id"] == fid)
+
+
+def ask_text(s: Any, fid: str, n: int, total: int) -> str:
+    f = _field(s, fid)
+    head = f"{n}/{total}: {f['label'][:300]}"
+    if f["kind"] == "checkbox":
+        return f"{head}\n(yes / no)"
+    opts = f.get("options") or []
+    if opts:
+        shown = "\n".join(f"{i}. {o[:70]}" for i, o in enumerate(opts[:8], 1))
+        more = "\n(or type your answer)" if len(opts) > 8 else ""
+        return f"{head}\n{shown}{more}"
+    return f"{head}\n(type your answer, or \"write it\" and i'll draft one)"
+
+
+def ready_text(s: Any, answers: dict[str, str]) -> str:
+    job = s.job
+    filled = [f for f in s.fields if f["kind"] != "file" and (answers.get(f["id"]) or str(f["value"]).strip())]
+    shown = {"true": "yes", "": "no"}
+    mine = "\n".join(f"• {_field(s, k)['label'][:40]}: {shown.get(v, v)[:60]}" for k, v in list(answers.items())[:6])
+    return (f"{job['company']} – {job['role']} is ready: {len(filled)} answers + your resume."
+            + (f"\nyour answers:\n{mine}" if mine else "")
+            + "\n\nreply \"submit\" to send it, or \"cancel\".")
+
+
+def parse_answer(f: dict[str, Any], reply: str) -> Optional[str]:
+    r = reply.strip()
+    if f["kind"] == "checkbox":
+        return "true" if re.match(r"^(y|yes|yeah|yep|sure|ok|true|check)", r, re.I) else (
+            "" if re.match(r"^(n|no|nope|nah|false)", r, re.I) else None)
+    opts = f.get("options") or []
+    if not opts:
+        return r or None
+    if r.isdigit() and 0 < int(r) <= len(opts):
+        return opts[int(r) - 1]
+    low = r.lower()
+    for test in (lambda o: o.lower() == low, lambda o: o.lower().startswith(low), lambda o: low in o.lower()):
+        hits = [o for o in opts if test(o)]
+        if len(hits) == 1:
+            return hits[0]
+    return r if f["kind"] == "combobox" and len(opts) > 8 else None
+
+
+async def write_answer(question: str, job: dict[str, Any], profile: dict[str, Any]) -> str:
+    from openai import AsyncOpenAI
+
+    cfg = chat.llm_config()
+    if not cfg:
+        return ""
+    client = AsyncOpenAI(api_key=cfg["key"], base_url=cfg["base"])
+    facts = json.dumps({k: v for k, v in profile.items() if v}, ensure_ascii=False)[:4000]
+    res = await client.chat.completions.create(
+        model=cfg["model"], max_tokens=1200, temperature=0.5,
+        extra_body={"reasoning_effort": "low"} if "gpt-oss" in cfg["model"] else None,
+        messages=[{"role": "system", "content": (
+            "Write a job application answer in the applicant's voice: 2-4 sentences, specific, first person, "
+            "no fluff. Use only these facts about them; never invent experience.\nFACTS: " + facts)},
+            {"role": "user", "content": f"{job['company']} – {job['role']}\nQuestion: {question}"}])
+    return (res.choices[0].message.content or "").strip()
+
+
+async def apply_action(phone: str, user_id: str, text: str) -> Optional[str]:
+    pending = _applies.get(user_id)
+    if not pending:
+        return None
+    t = text.strip().lower()
+    sid = pending["sid"]
+    s = inline_apply.SESSIONS.get(sid)
+    if not s or not s.page:
+        _applies.pop(user_id, None)
+        return "that form timed out. say \"apply\" again and i'll refill it."
+    s.touched = time.time()
+    if re.match(r"^(cancel|stop)\b", t):
+        _applies.pop(user_id, None)
+        await inline_apply.close_session(sid)
+        return "cancelled, nothing was sent."
+    queue: list[str] = pending["queue"]
+    if queue:
+        f = _field(s, queue[0])
+        if not f.get("options") and f["kind"] != "checkbox" and re.match(r"^(write it|you write|draft it|idk)", t):
+            draft = await write_answer(f["label"], s.job, pending["profile"])
+            if not draft:
+                return "couldn't draft that one. type your answer?"
+            pending["draft"] = draft
+            return f"how's this?\n\n{draft}\n\nreply \"ok\" to use it, or type your own."
+        if pending.get("draft") and re.match(r"^(ok|okay|yes|use it|good|perfect|looks good)\b", t):
+            value: Optional[str] = pending.pop("draft")
+        else:
+            pending.pop("draft", None)
+            value = parse_answer(f, text)
+        if value is None:
+            return "didn't catch that - reply with the number or the option.\n\n" + ask_text(
+                s, queue[0], len(pending["answers"]) + 1, len(pending["answers"]) + len(queue))
+        pending["answers"][queue.pop(0)] = value
+        if queue:
+            done = len(pending["answers"])
+            return ask_text(s, queue[0], done + 1, done + len(queue))
+        return ready_text(s, pending["answers"])
+    if not re.match(r"^(submit|send it|yes,? submit)\b", t):
+        return None
+    _applies.pop(user_id, None)
+    await send_text(phone, "submitting...")
+    await inline_apply._submit(s, pending["answers"])
+    job = s.job
+    if s.status == "submitted":
+        await record_application(user_id, job)
+        await inline_apply.close_session(sid)
+        return f"done - {job['company']} confirmed your application. it's in your tracker."
+    problems = "; ".join(s.errors[:3]) or s.detail
+    await inline_apply.close_session(sid)
+    return f"{job['company']} didn't confirm it ({problems[:200]}). finish it here:\n{_finish_link(job['id'])}"
+
+
 # ---- Conversation -----------------------------------------------------------
 
 def _now_ms() -> int:
@@ -255,7 +438,7 @@ async def reply_to(phone: str, text: str) -> None:
 
     state = await load_chat(user_id)
     state["messages"].append(_msg("me", text))
-    local = await draft_action(text, state)
+    local = await apply_action(phone, user_id, text) or await draft_action(text, state)
     if local:
         state["messages"].append(_msg("agent", local))
         await send_text(phone, local)
@@ -265,7 +448,8 @@ async def reply_to(phone: str, text: str) -> None:
     cfg = chat.llm_config()
     if not cfg:
         return
-    context = dict(state["context"].get("snapshot") or {})
+    snapshot = state["context"].get("snapshot") or {}
+    context = {k: v for k, v in snapshot.items() if k != "apply"}
     if not context:
         context["note"] = (f"this user's profile hasn't synced yet, so you know nothing about their jobs, "
                            f"applications or offers. say so in one line and ask them to open {SITE_URL} once.")
@@ -296,8 +480,7 @@ async def reply_to(phone: str, text: str) -> None:
             state["context"]["draftMsgId"] = m["id"]
             texts.append(draft_text(d))
         elif kind == "apply":
-            link = f"{SITE_URL}/applicant/jobs?apply={urllib.parse.quote(ev['job_id'])}"
-            texts.append(f"open this to review and submit:\n{link}")
+            _spawn(run_apply(phone, user_id, ev["job_id"], snapshot))
         elif kind == "person":
             state["context"]["person"] = ev["person"]
         elif kind == "error":

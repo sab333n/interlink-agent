@@ -54,6 +54,7 @@ class Session:
         self.screenshot: str = ""
         self.page: Optional[Page] = None
         self.resume_name = ""
+        self.task: Optional[asyncio.Task[None]] = None
 
     def public(self) -> dict:
         return {
@@ -318,26 +319,40 @@ class SubmitRequest(BaseModel):
     answers: dict[str, str]
 
 
-@router.post("/start")
-async def start(req: StartRequest, user: str = Depends(require_user)):
+async def open_session(job: dict, profile: dict, resume: Optional[bytes], resume_name: Optional[str],
+                       owner: str) -> Session:
+    """Registers a session and starts filling it in the background. Raises 503 when the host is full."""
     await _reap()
-    mine = [x for x in SESSIONS.values() if x.owner == user]
+    mine = [x for x in SESSIONS.values() if x.owner == owner]
     for old in sorted(mine, key=lambda x: x.touched)[: max(0, len(mine) - MAX_SESSIONS_PER_USER + 1)]:
         SESSIONS.pop(old.id, None)
         await _close(old)
     if len(SESSIONS) >= MAX_TOTAL_SESSIONS:
         raise HTTPException(503, "The agent is busy with other applications. Try again in a minute.")
     sid = uuid.uuid4().hex[:12]
-    s = Session(sid, req.job, user)
-    resume = None
-    if req.resume_b64:
+    s = Session(sid, job, owner)
+    path = None
+    if resume:
         SESSION_DIR.mkdir(exist_ok=True)
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", req.resume_name or "resume.pdf") or "resume.pdf"
-        resume = SESSION_DIR / f"{sid}-{name}"
-        resume.write_bytes(base64.b64decode(req.resume_b64))
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", resume_name or "resume.pdf") or "resume.pdf"
+        path = SESSION_DIR / f"{sid}-{name}"
+        path.write_bytes(resume)
         s.resume_name = name
     SESSIONS[sid] = s
-    asyncio.create_task(_prepare(s, req.profile, resume))
+    s.task = asyncio.create_task(_prepare(s, profile, path))
+    return s
+
+
+async def close_session(sid: str) -> None:
+    s = SESSIONS.pop(sid, None)
+    if s:
+        await _close(s)
+
+
+@router.post("/start")
+async def start(req: StartRequest, user: str = Depends(require_user)):
+    resume = base64.b64decode(req.resume_b64) if req.resume_b64 else None
+    s = await open_session(req.job, req.profile, resume, req.resume_name, user)
     return s.public()
 
 
