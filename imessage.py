@@ -43,6 +43,11 @@ CHANNEL_NOTE = (
 _codes: dict[str, tuple[str, float]] = {}
 _locks: dict[str, asyncio.Lock] = {}
 _nudged: dict[str, float] = {}
+_tasks: set[asyncio.Task[None]] = set()
+
+
+def log(msg: str) -> None:
+    print(f"[imessage] {msg}", flush=True)
 
 
 def sendblue_config() -> Optional[dict[str, str]]:
@@ -309,15 +314,16 @@ async def handle(phone: str, text: str, sent_at: str, backlog: bool) -> None:
             if backlog and await already_answered(phone, sent_at):
                 return
             await reply_to(phone, text)
+            log(f"answered •••{phone[-4:]}")
         except Exception as e:  # one bad text must not stop the poller
-            print(f"[imessage] reply to {phone[-4:]} failed: {e}")
+            log(f"reply to •••{phone[-4:]} failed: {e}")
 
 
 async def poll_forever() -> None:
     booted = datetime.now(timezone.utc)
     since = booted - timedelta(minutes=2)
     seen: dict[str, float] = {}
-    print("[imessage] polling Sendblue for texts")
+    log("polling Sendblue for texts")
     while True:
         try:
             for m in await inbound_since(since):
@@ -329,12 +335,15 @@ async def poll_forever() -> None:
                 if phone and text:
                     sent_at = m.get("date_sent") or ""
                     backlog = sent_at < booted.isoformat().replace("+00:00", "Z")
-                    asyncio.create_task(handle(phone, text, sent_at, backlog))
+                    log(f"text from •••{phone[-4:]}")
+                    task = asyncio.create_task(handle(phone, text, sent_at, backlog))
+                    _tasks.add(task)
+                    task.add_done_callback(_tasks.discard)
             since = datetime.now(timezone.utc) - timedelta(minutes=2)
             for k in [k for k, t in seen.items() if time.time() - t > 600]:
                 del seen[k]
         except Exception as e:
-            print(f"[imessage] poll failed: {e}")
+            log(f"poll failed: {e}")
         await asyncio.sleep(POLL_SECONDS)
 
 
