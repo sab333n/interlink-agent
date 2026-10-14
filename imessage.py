@@ -266,6 +266,9 @@ async def reply_to(phone: str, text: str) -> None:
     if not cfg:
         return
     context = dict(state["context"].get("snapshot") or {})
+    if not context:
+        context["note"] = (f"this user's profile hasn't synced yet, so you know nothing about their jobs, "
+                           f"applications or offers. say so in one line and ask them to open {SITE_URL} once.")
     context["current_person"] = state["context"].get("person")
     await send_typing(phone)
 
