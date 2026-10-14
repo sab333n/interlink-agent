@@ -50,6 +50,7 @@ app = FastAPI(title="InterLink AI Agent API")
 
 from inline_apply import router as inline_apply_router  # noqa: E402
 from email_finder import router as email_finder_router  # noqa: E402
+from chat import router as chat_router  # noqa: E402
 from auth import auth_required  # noqa: E402
 
 # Hosted, the agent serves many users, so the single shared local queue (which
@@ -66,6 +67,7 @@ async def block_local_only(request: Request, call_next):
 
 app.include_router(inline_apply_router)
 app.include_router(email_finder_router)
+app.include_router(chat_router)
 
 app.add_middleware(
     CORSMiddleware,
