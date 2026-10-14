@@ -184,17 +184,19 @@ async def run_tool(name: str, args: dict[str, Any], ctx: dict[str, Any]) -> tupl
     return f"Unknown tool {name}.", []
 
 
-async def stream_reply(req: ChatRequest, cfg: dict[str, str]) -> AsyncIterator[bytes]:
+async def run_chat(turns: list[dict[str, str]], context: dict[str, Any], cfg: dict[str, str],
+                   channel_note: str = "") -> AsyncIterator[dict[str, Any]]:
+    """Yields events: text deltas, tool results (picks/draft/apply/person) and errors."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(api_key=cfg["key"], base_url=cfg["base"])
-    history = [{"role": t.role if t.role in ("user", "assistant") else "user", "content": t.content}
-               for t in req.messages[-24:] if t.content.strip()]
+    history = [{"role": t["role"] if t["role"] in ("user", "assistant") else "user", "content": t["content"]}
+               for t in turns[-24:] if t["content"].strip()]
     last = history[-1]["content"] if history else ""
     model = cfg["fast"] if is_quick(last) and not re.search(r"linkedin\.com/in/", last) else cfg["model"]
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": context_block(req.context)},
+        {"role": "system", "content": SYSTEM_PROMPT + (f"\n\n{channel_note}" if channel_note else "")},
+        {"role": "system", "content": context_block(context)},
         *history,
     ]
     try:
@@ -210,7 +212,7 @@ async def stream_reply(req: ChatRequest, cfg: dict[str, str]) -> AsyncIterator[b
                 delta = chunk.choices[0].delta
                 if delta.content:
                     text += delta.content
-                    yield event({"type": "text", "delta": delta.content})
+                    yield {"type": "text", "delta": delta.content}
                 for tc in delta.tool_calls or []:
                     slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
                     slot["id"] = tc.id or slot["id"]
@@ -228,16 +230,22 @@ async def stream_reply(req: ChatRequest, cfg: dict[str, str]) -> AsyncIterator[b
                     args = json.loads(c["args"] or "{}")
                 except ValueError:
                     args = {}
-                result, events = await run_tool(c["name"], args, req.context)
+                result, events = await run_tool(c["name"], args, context)
                 for ev in events:
-                    yield event(ev)
+                    yield ev
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
             # Tool results need judgment to summarize, so the follow-up uses the writing model.
             model = cfg["model"]
             if text:
-                yield event({"type": "text", "delta": "\n"})
+                yield {"type": "text", "delta": "\n"}
     except Exception as e:  # provider errors shouldn't crash the stream mid-way
-        yield event({"type": "error", "message": f"model error: {str(e)[:200]}"})
+        yield {"type": "error", "message": f"model error: {str(e)[:200]}"}
+
+
+async def stream_reply(req: ChatRequest, cfg: dict[str, str]) -> AsyncIterator[bytes]:
+    turns = [{"role": t.role, "content": t.content} for t in req.messages]
+    async for ev in run_chat(turns, req.context, cfg):
+        yield event(ev)
 
 
 @router.get("/config")
