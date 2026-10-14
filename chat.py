@@ -33,7 +33,7 @@ router = APIRouter(prefix="/api/chat")
 
 PROVIDERS = [
     ("LLM_API_KEY", None, None, None),
-    ("GROQ_API_KEY", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"),
+    ("GROQ_API_KEY", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b", "openai/gpt-oss-20b"),
     ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-4o", "gpt-4o-mini"),
     ("XAI_API_KEY", "https://api.x.ai/v1", "grok-3", "grok-3-mini"),
 ]
@@ -200,7 +200,9 @@ async def stream_reply(req: ChatRequest, cfg: dict[str, str]) -> AsyncIterator[b
     try:
         for _ in range(4):
             stream = await client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLS, stream=True, temperature=0.6, max_tokens=500)
+                model=model, messages=messages, tools=TOOLS, stream=True, temperature=0.6,
+                max_tokens=1500 if "gpt-oss" in model else 500,
+                extra_body={"reasoning_effort": "low"} if "gpt-oss" in model else None)
             text, calls = "", {}
             async for chunk in stream:
                 if not chunk.choices:
