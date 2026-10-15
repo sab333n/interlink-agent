@@ -87,7 +87,7 @@ def profile_answer(label: str) -> str | None:
             x for x in [PROFILE.get("city", ""), PROFILE.get("state", "")] if x
         )),
         (r"years of (professional )?experience", PROFILE.get("years_experience", "")),
-        (r"how did you hear|source|referr", "Online job board"),
+        (r"how (did )?you (hear|heard)|source|referr", "Online job board"),
     ]
     for pattern, value in table:
         if re.search(pattern, q):
@@ -123,7 +123,7 @@ def question_answer(label: str) -> str | None:
         return yn
     if re.search(r"what city|which city", q):
         return PROFILE.get("city", "") or None
-    if re.search(r"how did you (hear|find|learn)|where did you (hear|find)", q):
+    if re.search(r"how (did )?you (hear|heard|find|found|learn)|where did you (hear|find)", q):
         return "Online job board"
     if re.search(r"years of .{0,20}experience", q):
         return str(PROFILE.get("years_experience", "")) or None
