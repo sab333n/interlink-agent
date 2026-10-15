@@ -53,6 +53,8 @@ from email_finder import router as email_finder_router  # noqa: E402
 from chat import router as chat_router  # noqa: E402
 import imessage  # noqa: E402
 from extension import router as extension_router  # noqa: E402
+from tailor import router as tailor_router  # noqa: E402
+import alerts  # noqa: E402
 from auth import auth_required  # noqa: E402
 
 # Hosted, the agent serves many users, so the single shared local queue (which
@@ -72,11 +74,14 @@ app.include_router(email_finder_router)
 app.include_router(chat_router)
 app.include_router(imessage.router)
 app.include_router(extension_router)
+app.include_router(tailor_router)
+app.include_router(alerts.router)
 
 
 @app.on_event("startup")
 async def _start_imessage() -> None:
     imessage.start_background()
+    alerts.start_background()
 
 app.add_middleware(
     CORSMiddleware,
