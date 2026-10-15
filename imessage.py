@@ -18,7 +18,6 @@ import os
 import random
 import re
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -29,6 +28,7 @@ from pydantic import BaseModel
 
 import chat
 import inline_apply
+from supa import admin_config, db, db_headers as _db_headers, http
 from auth import auth_required, require_user
 
 router = APIRouter(prefix="/api/imessage")
@@ -60,32 +60,8 @@ def sendblue_config() -> Optional[dict[str, str]]:
     return {"key": key, "secret": secret, "number": number} if key and secret and number else None
 
 
-def admin_config() -> Optional[tuple[str, str]]:
-    base = os.getenv("SUPABASE_URL", "").rstrip("/")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    return (base, key) if base and key else None
-
-
 def enabled() -> bool:
     return bool(sendblue_config() and admin_config() and chat.llm_config())
-
-
-def _http(method: str, url: str, headers: dict[str, str], body: Any = None, raw: bool = False) -> Any:
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={**headers, **({"Content-Type": "application/json"} if data else {})})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            content = r.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"{method} {url.split('?')[0]} → {e.code}: {e.read()[:200]!r}") from None
-    if raw:
-        return content
-    return json.loads(content) if content.strip() else None
-
-
-async def http(method: str, url: str, headers: dict[str, str], body: Any = None, raw: bool = False) -> Any:
-    return await asyncio.to_thread(_http, method, url, headers, body, raw)
 
 
 # ---- Sendblue ---------------------------------------------------------------
@@ -130,19 +106,6 @@ async def inbound_since(since: datetime) -> list[dict[str, Any]]:
 
 
 # ---- Supabase (service role, bypasses RLS; always filter by user) -----------
-
-def _db_headers(prefer: str = "") -> dict[str, str]:
-    _, key = admin_config() or ("", "")
-    h = {"apikey": key, "Authorization": f"Bearer {key}"}
-    if prefer:
-        h["Prefer"] = prefer
-    return h
-
-
-async def db(method: str, path: str, body: Any = None, prefer: str = "") -> Any:
-    base, _ = admin_config() or ("", "")
-    return await http(method, f"{base}/rest/v1/{path}", _db_headers(prefer), body)
-
 
 async def user_for_phone(phone: str) -> Optional[str]:
     rows = await db("GET", f"phone_links?select=user_id&phone=eq.{urllib.parse.quote(phone)}")
@@ -228,15 +191,24 @@ async def run_apply(phone: str, user_id: str, job_id: str, snapshot: dict[str, A
         await send_text(phone, f"couldn't fill {job['company']} from here ({s.detail.lower() or s.status}). "
                                f"finish it yourself:\n{job['apply_url']}")
         return
-    queue = [f["id"] for f in s.fields
-             if f["required"] and f["kind"] != "file" and not str(f["value"]).strip()]
-    _applies[user_id] = {"sid": s.id, "queue": queue, "answers": {}, "profile": info.get("profile") or {}}
+    auto: dict[str, str] = {}
+    queue: list[str] = []
+    for f in s.fields:
+        if f["kind"] == "file" or str(f["value"]).strip():
+            continue
+        if f.get("source") in ("fact", "past"):
+            auto[f["id"]] = f["suggested"]
+        elif f["required"]:
+            queue.append(f["id"])
+    _applies[user_id] = {"sid": s.id, "queue": queue, "answers": dict(auto), "auto": list(auto),
+                         "profile": info.get("profile") or {}}
+    extra = f" and answered {len(auto)} more from your profile" if auto else ""
     if queue:
-        await send_text(phone, f"filled the basics for {name}. {len(queue)} question"
-                               f"{'s' if len(queue) > 1 else ''} only you can answer - reply \"cancel\" anytime.")
+        await send_text(phone, f"filled {name}{extra}. {len(queue)} question"
+                               f"{'s' if len(queue) > 1 else ''} left for you - reply \"cancel\" anytime.")
         await send_text(phone, ask_text(s, queue[0], 1, len(queue)))
         return
-    await send_text(phone, ready_text(s, {}))
+    await send_text(phone, ready_text(s, _applies[user_id]))
 
 
 def _field(s: Any, fid: str) -> dict[str, Any]:
@@ -253,16 +225,24 @@ def ask_text(s: Any, fid: str, n: int, total: int) -> str:
         shown = "\n".join(f"{i}. {o[:70]}" for i, o in enumerate(opts[:8], 1))
         more = "\n(or type your answer)" if len(opts) > 8 else ""
         return f"{head}\n{shown}{more}"
+    if f.get("source") == "draft" and f.get("suggested"):
+        return f"{head}\n\nmy draft:\n{f['suggested']}\n\nreply \"ok\" to use it, or type your own."
     return f"{head}\n(type your answer, or \"write it\" and i'll draft one)"
 
 
-def ready_text(s: Any, answers: dict[str, str]) -> str:
-    job = s.job
+def ready_text(s: Any, pending: dict[str, Any]) -> str:
+    job, answers = s.job, pending["answers"]
     filled = [f for f in s.fields if f["kind"] != "file" and (answers.get(f["id"]) or str(f["value"]).strip())]
     shown = {"true": "yes", "": "no"}
-    mine = "\n".join(f"• {_field(s, k)['label'][:40]}: {shown.get(v, v)[:60]}" for k, v in list(answers.items())[:6])
+
+    def lines(ids: list[str]) -> str:
+        return "\n".join(f"• {_field(s, k)['label'][:45]}: {shown.get(answers[k], answers[k])[:60]}" for k in ids[:8])
+
+    auto = [k for k in pending.get("auto", []) if k in answers]
+    mine = [k for k in answers if k not in auto]
     return (f"{job['company']} – {job['role']} is ready: {len(filled)} answers + your resume."
-            + (f"\nyour answers:\n{mine}" if mine else "")
+            + (f"\n\ni answered these for you - check them:\n{lines(auto)}" if auto else "")
+            + (f"\n\nyour answers:\n{lines(mine)}" if mine else "")
             + "\n\nreply \"submit\" to send it, or \"cancel\".")
 
 
@@ -326,19 +306,21 @@ async def apply_action(phone: str, user_id: str, text: str) -> Optional[str]:
                 return "couldn't draft that one. type your answer?"
             pending["draft"] = draft
             return f"how's this?\n\n{draft}\n\nreply \"ok\" to use it, or type your own."
-        if pending.get("draft") and re.match(r"^(ok|okay|yes|use it|good|perfect|looks good)\b", t):
-            value: Optional[str] = pending.pop("draft")
+        offered = pending.get("draft") or (f.get("suggested") if f.get("source") == "draft" else None)
+        if offered and re.match(r"^(ok|okay|yes|use it|good|perfect|looks good)\b", t):
+            pending.pop("draft", None)
+            value: Optional[str] = offered
         else:
             pending.pop("draft", None)
             value = parse_answer(f, text)
+        done = len(pending["answers"]) - len(pending.get("auto", []))
         if value is None:
             return "didn't catch that - reply with the number or the option.\n\n" + ask_text(
-                s, queue[0], len(pending["answers"]) + 1, len(pending["answers"]) + len(queue))
+                s, queue[0], done + 1, done + len(queue))
         pending["answers"][queue.pop(0)] = value
         if queue:
-            done = len(pending["answers"])
-            return ask_text(s, queue[0], done + 1, done + len(queue))
-        return ready_text(s, pending["answers"])
+            return ask_text(s, queue[0], done + 2, done + 1 + len(queue))
+        return ready_text(s, pending)
     if not re.match(r"^(submit|send it|yes,? submit)\b", t):
         return None
     _applies.pop(user_id, None)

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from pydantic import BaseModel
 
+import answers
 import queue_runner as qr
 from auth import require_user
 
@@ -55,6 +56,7 @@ class Session:
         self.page: Optional[Page] = None
         self.resume_name = ""
         self.task: Optional[asyncio.Task[None]] = None
+        self.learn: list[tuple[str, str]] = []
 
     def public(self) -> dict:
         return {
@@ -227,6 +229,7 @@ async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
     if not url:
         s.status, s.detail = "unsupported", "This listing has no application link."
         return
+    filled = False
     async with _fill_lock:
         _use_profile(profile, resume)
         s.context = await _new_context()
@@ -246,18 +249,28 @@ async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
                 s.status, s.detail = "blocked", detail
                 return
             s.fields = await _collect(page)
-            s.status, s.detail = "ready", detail
+            s.detail = detail
+            filled = True
         except Exception as e:
             s.status, s.detail = "error", f"{type(e).__name__}: {e}"[:300]
             s.screenshot = await _shot(page)
+    if filled:
+        s.status = "answering"
+        for fid, hint in (await answers.suggest(s.fields, s.job, profile, s.owner)).items():
+            field = next(f for f in s.fields if f["id"] == fid)
+            field["suggested"], field["source"] = hint["answer"], hint["source"]
+        s.status = "ready"
 
 
-async def _submit(s: Session, answers: dict[str, str]) -> None:
+async def _submit(s: Session, answers_in: dict[str, str]) -> None:
     page = s.page
     assert page is not None
     s.status, s.errors = "submitting", []
     by_id = {f["id"]: f for f in s.fields}
-    for fid, value in answers.items():
+    s.learn = [(by_id[fid]["label"], {"true": "yes"}.get(v, v)) for fid, v in answers_in.items()
+               if fid in by_id and by_id[fid]["kind"] != "file" and v.strip()
+               and not str(by_id[fid]["value"]).strip()]
+    for fid, value in answers_in.items():
         f = by_id.get(fid)
         if not f or f["kind"] == "file" or value == f["value"]:
             continue
@@ -293,6 +306,7 @@ async def _submit(s: Session, answers: dict[str, str]) -> None:
         if CONFIRMATION.search(text):
             s.status, s.detail = "submitted", "The employer confirmed your application."
             s.screenshot = await _shot(page)
+            await answers.remember(s.owner, s.job.get("company", ""), s.learn)
             return
     problems = await page.evaluate(
         """() => [...document.querySelectorAll('[aria-invalid=true], .error, .field-error, [class*="error" i]')]
