@@ -196,13 +196,17 @@ async def run_apply(phone: str, user_id: str, job_id: str, snapshot: dict[str, A
     for f in s.fields:
         if f["kind"] == "file" or str(f["value"]).strip():
             continue
-        if f.get("source") in ("fact", "past"):
+        if f.get("suggested"):
+            # Fact, past, and essay drafts are all pre-filled; user only reviews at "submit".
             auto[f["id"]] = f["suggested"]
         elif f["required"]:
             queue.append(f["id"])
     _applies[user_id] = {"sid": s.id, "queue": queue, "answers": dict(auto), "auto": list(auto),
                          "profile": info.get("profile") or {}}
-    extra = f" and answered {len(auto)} more from your profile" if auto else ""
+    drafts = sum(1 for f in s.fields if f.get("source") == "draft" and f["id"] in auto)
+    extra = f" and answered {len(auto)} more for you" if auto else ""
+    if drafts:
+        extra += f" ({drafts} essay draft{'s' if drafts != 1 else ''})"
     if queue:
         await send_text(phone, f"filled {name}{extra}. {len(queue)} question"
                                f"{'s' if len(queue) > 1 else ''} left for you - reply \"cancel\" anytime.")

@@ -133,6 +133,15 @@ def _rule_answer(f: dict[str, Any]) -> Optional[str]:
             decline = next((o for o in opts if qr.DECLINE_OPTION.search(o)), None)
             if decline:
                 return decline
+        if re.search(r"term|available to intern|which (term|season)|internship period", label, re.I):
+            summer = [o for o in opts if re.search(r"summer", o, re.I)]
+            if summer:
+                return ", ".join(summer) if kind == "checkboxes" else summer[0]
+        if re.search(r"how (did )?you (hear|heard)|source|referr", label, re.I):
+            for pattern in (r"online job board", r"simplify", r"career", r"job board|internet|website|other"):
+                hit = next((o for o in opts if re.search(pattern, o, re.I)), None)
+                if hit:
+                    return hit
         direct = qr.answer_for(label)
         choice = qr.pick_option(opts, direct) if direct else None
         if direct == "Online job board" and not choice:
