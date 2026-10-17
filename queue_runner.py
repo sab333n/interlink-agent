@@ -114,10 +114,24 @@ def question_answer(label: str) -> str | None:
         return PROFILE.get("visa_status", "") or None
     if re.search(r"relatives?|family member|close personal relationship", q) and re.search(r"employ|work", q):
         return "No"
-    if re.search(r"sponsor", q):
-        return yes_no(PROFILE.get("sponsorship", ""))
-    if re.search(r"authori[sz]ed to work|eligible to work|legally (authori|able)|right to work", q):
-        return yes_no(PROFILE.get("work_auth", ""))
+    if re.search(r"sponsor|h-?1b", q):
+        return yes_no(PROFILE.get("sponsorship", "")) or "No"
+    if re.search(r"authori[sz]ed to work|lawfully|eligible to work|legally (authori|able)|right to work", q):
+        return yes_no(PROFILE.get("work_auth", "")) or "Yes"
+    if re.search(r"willing to work|work from the office|in.?office|on.?site", q):
+        return yes_no(PROFILE.get("relocation", "")) or "Yes"
+    if re.search(r"optional practical|\bopt\b|stem\s*opt|\bcpt\b", q):
+        if re.search(r"f-1|cpt|opt|stem", visa):
+            return "Yes"
+        if re.search(r"citizen|permanent|green card", visa):
+            return "No"
+        return "No"
+    if re.search(r"graduation timeline|expected graduation", q):
+        return grad or None
+    if re.search(r"office location|most interested in", q):
+        return None  # needs options from the form
+    if re.search(r"end date month|start month", q):
+        return "May"
     yn = agent.decide_yes_no(label)
     if yn:
         return yn

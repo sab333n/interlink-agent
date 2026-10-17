@@ -210,6 +210,45 @@ def _real_choice(value: str, options: list[str]) -> Optional[str]:
     return text
 
 
+async def _refresh_select_options(page: Page, fields: list[dict[str, Any]]) -> None:
+    """Open each blank select/combobox once so Greenhouse react-select options are known."""
+    for f in fields:
+        if f.get("kind") not in ("select", "combobox"):
+            continue
+        if f.get("options") and str(f.get("value") or "").strip():
+            continue
+        loc = page.locator(f"[data-il='{f['id']}']")
+        try:
+            if f["kind"] == "select":
+                opts = await loc.evaluate(
+                    """e => [...e.options].filter(o => o.value !== '' && !/^select/i.test((o.text||'').trim()))
+                       .map(o => (o.text||'').replace(/\\s+/g,' ').trim())"""
+                )
+                if opts:
+                    f["options"] = opts
+                continue
+            iid = await loc.get_attribute("id")
+            sel = f'[id^="react-select-{iid}-option"]' if iid else "[role=option]"
+            await loc.scroll_into_view_if_needed(timeout=2000)
+            try:
+                await loc.click(timeout=2000)
+            except Exception:
+                await loc.focus(timeout=2000)
+            await page.keyboard.press("ArrowDown")
+            await asyncio.sleep(0.55)
+            opts = [t.strip() for t in await page.locator(sel).all_inner_texts() if t.strip()]
+            opts = [o for o in opts if not _PLACEHOLDER.match(o)]
+            if opts:
+                f["options"] = opts[:400]
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.15)
+        except Exception:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+
 async def _set_value(page: Page, field: dict, value: str) -> None:
     kind = field["kind"]
     opts = list(field.get("options") or [])
@@ -289,9 +328,13 @@ async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
             s.screenshot = await _shot(page)
     if filled:
         s.status = "answering"
+        await _refresh_select_options(page, s.fields)
         for fid, hint in (await answers.suggest(s.fields, s.job, profile, s.owner)).items():
             field = next(f for f in s.fields if f["id"] == fid)
             field["suggested"], field["source"] = hint["answer"], hint["source"]
+            # Also stamp onto value so the review UI and re-submit both see it.
+            if not str(field.get("value") or "").strip():
+                field["value"] = hint["answer"]
         s.status = "ready"
 
 

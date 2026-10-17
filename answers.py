@@ -132,6 +132,35 @@ def _skills(profile: dict[str, Any]) -> str:
     return str(profile.get("skills_summary") or "").lower()
 
 
+def _pick_yes_no(opts: list[str], yn: str) -> Optional[str]:
+    hit = next((o for o in opts if re.match(rf"^\s*{yn}\b", o, re.I)), None)
+    if hit:
+        return hit
+    return next((o for o in opts if re.search(rf"\b{yn}\b", o, re.I)), None)
+
+
+def _yn_from_profile(q: str, profile: dict[str, Any]) -> Optional[str]:
+    visa = str(profile.get("visa_status", "")).lower()
+    if re.search(r"sponsor|h-?1b|immigration", q):
+        return "yes" if str(profile.get("sponsorship", "")).lower().startswith("y") else "no"
+    if re.search(r"authori[sz]ed|lawfully|eligible to work|legally (authori|able)|right to work", q):
+        auth = str(profile.get("work_auth", "yes")).lower()
+        return "no" if auth in ("no", "n") or "not authorized" in auth else "yes"
+    if re.search(r"willing to work|work from the office|in.?office|on.?site|hybrid|relocat", q):
+        rel = str(profile.get("relocation", "yes")).lower()
+        return "no" if rel.startswith("n") else "yes"
+    if re.search(r"optional practical|stem\s*opt|\bopt\b|\bcpt\b|f-1", q):
+        if re.search(r"f-1|cpt|opt|stem", visa):
+            return "yes"
+        if re.search(r"citizen|permanent|green card", visa):
+            return "no"
+        # Unknown visa — default No so the form isn't blocked; user can edit.
+        return "no"
+    if re.search(r"duolingo account", q):
+        return "no"
+    return None
+
+
 def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any]) -> Optional[dict[str, str]]:
     """Rule-based last pass so required / common blanks don't stay empty."""
     label = field.get("label") or ""
@@ -142,6 +171,26 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
     grad = str(profile.get("graduation_year") or "")
     company = job.get("company") or "the company"
     role = job.get("role") or "this role"
+    loc = str(job.get("location") or "")
+
+    # Short profile fields (Greenhouse often leaves these blank until suggest).
+    if kind in ("text", "input", "email", "tel") and not opts:
+        table = [
+            (r"preferred (first )?name", profile.get("first_name")),
+            (r"first name|given name", profile.get("first_name")),
+            (r"last name|family name|surname", profile.get("last_name")),
+            (r"e-?mail", profile.get("email")),
+            (r"phone|mobile", profile.get("phone")),
+            (r"linkedin", profile.get("linkedin")),
+            (r"github", profile.get("github")),
+            (r"website|portfolio|personal site", profile.get("portfolio") or profile.get("github")),
+            (r"undergraduate gpa|college gpa|\bgpa\b", profile.get("gpa") or "N/A"),
+            (r"pronounce your name|pronunciation", profile.get("first_name")),
+            (r"end date year|graduation year|to year", grad),
+        ]
+        for pattern, value in table:
+            if value and re.search(pattern, q):
+                return {"answer": str(value), "source": "fact"}
 
     if kind == "checkbox" and re.search(r"agree|acknowledge|certify|confirm|consent|privacy", q):
         return {"answer": "true", "source": "fact"}
@@ -152,12 +201,30 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
         if decline:
             return {"answer": decline, "source": "fact"}
 
-    if opts and re.search(r"how (did|do) you (hear|heard|find|learn)|source|referr", q):
-        for pattern in (r"online job board", r"simplify", r"career (fair|website)", r"job board",
+    if opts and re.search(r"how (did|do) you (hear|heard|find|learn)|where did you hear|source|referr", q):
+        for pattern in (r"online job board", r"simplify", r"linkedin", r"career (fair|website)", r"job board",
                         r"internet|website|other"):
             hit = next((o for o in opts if re.search(pattern, o, re.I)), None)
             if hit:
                 return {"answer": hit, "source": "fact"}
+
+    # Graduation timeline / expected graduation (term + year style options).
+    if opts and re.search(r"graduation timeline|expected graduation|graduat.*(term|date|when|timeline)", q):
+        year = grad if grad.isdigit() else ""
+        for pattern in (
+            rf"summer\s*{year}" if year else None,
+            rf"{year}" if year else None,
+            r"summer\s*2027|summer\s*2026|spring\s*2027|fall\s*2026",
+            r"summer",
+            r"spring|winter|fall",
+        ):
+            if not pattern:
+                continue
+            hit = next((o for o in opts if re.search(pattern, o, re.I)), None)
+            if hit:
+                return {"answer": hit, "source": "fact"}
+        if opts:
+            return {"answer": opts[0], "source": "fact"}
 
     if opts and re.search(r"term|available to intern|which (term|season)|internship period", q):
         picks = [o for o in opts if re.search(r"summer", o, re.I)]
@@ -168,15 +235,36 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
         if picks:
             return {"answer": ", ".join(picks) if kind == "checkboxes" else picks[0], "source": "fact"}
 
+    # Office location preference (Pittsburgh / NYC / Remote…).
+    if opts and re.search(r"office location|which (office|location|city)|most interested in", q):
+        loc_l = loc.lower()
+        for city in ("pittsburgh", "new york", "nyc", "san francisco", "seattle", "austin", "remote"):
+            if city in loc_l:
+                hit = next((o for o in opts if re.search(re.escape(city), o, re.I)), None)
+                if hit:
+                    return {"answer": hit, "source": "fact"}
+        hit = next((o for o in opts if re.search(r"pittsburgh|new york|nyc", o, re.I)), None)
+        if hit:
+            return {"answer": hit, "source": "fact"}
+        if opts:
+            return {"answer": opts[0], "source": "fact"}
+
+    if opts and re.search(r"end date month|start date month|from month|to month|\bmonth\b", q):
+        # Education end month — May is the common US undergrad default.
+        for m in ("may", "june", "december", "may"):
+            hit = next((o for o in opts if re.search(rf"^{m}$|{m}", o, re.I)), None)
+            if hit:
+                return {"answer": hit, "source": "fact"}
+        if opts:
+            return {"answer": opts[min(4, len(opts) - 1)], "source": "fact"}  # often May is index ~4
+
     if opts and re.search(r"area of interest|focus area|team interest|which team|engineering track", q):
         prefer = []
-        if re.search(r"python|go\b|golang|rust|c\+\+|backend|postgres|kubernetes|infra", skills):
-            prefer += [r"backend|systems|infrastructure|platform|distributed"]
+        if re.search(r"python|go\b|golang|rust|c\+\+|backend|postgres|kubernetes|infra|data|ml|stat", skills):
+            prefer += [r"data|machine learning|ml|ai\b|analytics", r"backend|systems|infrastructure|platform"]
         if re.search(r"react|typescript|frontend|css|ui\b", skills):
             prefer += [r"frontend|full.?stack|web"]
-        if re.search(r"security|crypto|network", skills):
-            prefer += [r"security|network"]
-        prefer += [r"full.?stack|software|general"]
+        prefer += [r"full.?stack|software|general|data"]
         for pattern in prefer:
             hit = next((o for o in opts if re.search(pattern, o, re.I)), None)
             if hit:
@@ -193,22 +281,21 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
             if hit:
                 return {"answer": hit, "source": "fact"}
 
-    if opts and re.search(r"\b(yes|no)\b", " ".join(opts).lower()) and len(opts) <= 6:
-        if re.search(r"sponsor|visa|immigration", q):
-            yn = "yes" if str(profile.get("sponsorship", "")).lower().startswith("y") else "no"
-        elif re.search(r"authori[sz]ed|eligible to work|legally", q):
-            yn = "yes" if str(profile.get("work_auth", "yes")).lower() not in ("no", "n") else "no"
-        elif re.search(r"relocat|in.?office|on.?site|hybrid|40 hour|full.?time|enrolled|return to", q):
-            yn = "yes"
-        elif re.search(r"\bcpt\b|\bopt\b|f-1", q):
-            visa = str(profile.get("visa_status", "")).lower()
-            yn = "yes" if re.search(r"f-1|cpt|opt", visa) else "no"
-        else:
-            yn = None
-        if yn:
-            hit = next((o for o in opts if re.match(rf"^\s*{yn}\b", o, re.I)), None)
+    # Yes/No style selects (work auth, sponsorship, OPT, office willingness).
+    yn = _yn_from_profile(q, profile)
+    if yn and (opts or kind in ("select", "combobox", "radio")):
+        if opts:
+            hit = _pick_yes_no(opts, yn)
             if hit:
                 return {"answer": hit, "source": "fact"}
+        else:
+            return {"answer": yn.capitalize(), "source": "fact"}
+
+    if opts and re.search(r"\b(yes|no)\b", " ".join(opts).lower()) and len(opts) <= 8:
+        yn2 = yn or "yes"
+        hit = _pick_yes_no(opts, yn2)
+        if hit:
+            return {"answer": hit, "source": "fact"}
 
     if opts and re.search(r"degree|bachelor|master", q):
         degree = str(profile.get("degree_full") or profile.get("degree") or "")
@@ -220,6 +307,8 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
     if kind in ("textarea",) or (kind in ("text", "input") and (len(label) > 80 or "?" in label)):
         if re.search(r"if different|preferred name|pronoun|salary|compensation|referral name|employee name", q):
             return None
+        if re.search(r"duolingo account|username", q):
+            return {"answer": "No", "source": "fact"}
         exp = (profile.get("work_experience") or [{}])
         latest = exp[0] if isinstance(exp, list) and exp else {}
         proof = (latest.get("description") or profile.get("skills_summary") or "").strip()
