@@ -198,30 +198,63 @@ async def _collect(page: Page) -> list[dict[str, Any]]:
     return fields
 
 
+_PLACEHOLDER = re.compile(r"^(select|choose)([.…\s].*)?$", re.I)
+
+
+def _real_choice(value: str, options: list[str]) -> Optional[str]:
+    text = (value or "").strip()
+    if not text or _PLACEHOLDER.match(text):
+        return None
+    if options:
+        return qr.pick_option(options, text) or answers._match_options(options, text)
+    return text
+
+
 async def _set_value(page: Page, field: dict, value: str) -> None:
     kind = field["kind"]
+    opts = list(field.get("options") or [])
+    choice = _real_choice(value, opts)
+    if kind != "checkbox" and choice is None:
+        raise ValueError("empty or placeholder — pick a real option")
     if kind == "radio":
-        idx = field["optionIds"][field["options"].index(value)]
+        idx = field["optionIds"][field["options"].index(choice)]
         await page.locator(f"[data-il='{idx}']").check(timeout=4000, force=True)
         return
     loc = page.locator(f"[data-il='{field['id']}']")
     if kind == "select":
-        await loc.select_option(label=value, timeout=4000)
+        try:
+            await loc.select_option(label=choice, timeout=4000)
+        except Exception:
+            # Some Greenhouse selects match on value, not visible label.
+            await loc.select_option(label=re.compile(re.escape(choice), re.I), timeout=4000)
     elif kind == "checkbox":
         await (loc.check if value else loc.uncheck)(timeout=4000)
     elif kind == "combobox":
         iid = await loc.get_attribute("id")
         sel = f'[id^="react-select-{iid}-option"]' if iid else "[role=option]"
-        await loc.focus(timeout=4000)
-        await loc.fill(value, timeout=4000)
-        await asyncio.sleep(1.2)
-        exact = re.compile(r"^\s*" + re.escape(value) + r"\s*$")
+        control = loc.locator("xpath=ancestor::*[contains(@class,'select__control') or contains(@class,'Select')][1]")
+        try:
+            if await control.count():
+                await control.first.click(timeout=3000)
+            else:
+                await loc.click(timeout=3000)
+        except Exception:
+            await loc.focus(timeout=4000)
+        await loc.fill("", timeout=4000)
+        await loc.fill(choice, timeout=4000)
+        await asyncio.sleep(1.0)
+        exact = re.compile(r"^\s*" + re.escape(choice) + r"\s*$", re.I)
         opt = page.locator(sel).filter(has_text=exact)
         if await opt.count() == 0:
+            opt = page.locator(sel).filter(has_text=re.compile(re.escape(choice), re.I))
+        if await opt.count() == 0:
             opt = page.locator(sel)
-        await opt.first.click(timeout=4000)
+        if await opt.count() == 0:
+            await page.keyboard.press("Enter")
+        else:
+            await opt.first.click(timeout=4000)
     else:
-        await loc.fill(value, timeout=4000)
+        await loc.fill(choice, timeout=4000)
 
 
 async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
@@ -268,15 +301,22 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
     s.status, s.errors = "submitting", []
     by_id = {f["id"]: f for f in s.fields}
     s.learn = [(by_id[fid]["label"], {"true": "yes"}.get(v, v)) for fid, v in answers_in.items()
-               if fid in by_id and by_id[fid]["kind"] != "file" and v.strip()
+               if fid in by_id and by_id[fid]["kind"] != "file" and _real_choice(v, by_id[fid].get("options") or [])
                and not str(by_id[fid]["value"]).strip()]
     for fid, value in answers_in.items():
         f = by_id.get(fid)
-        if not f or f["kind"] == "file" or value == f["value"]:
+        if not f or f["kind"] == "file":
+            continue
+        choice = _real_choice(value, f.get("options") or [])
+        if choice is None:
+            if f.get("required"):
+                s.errors.append(f"“{f['label'][:80]}” still needs an option (not Select…).")
+            continue
+        if choice == f.get("value"):
             continue
         try:
-            await _set_value(page, f, value)
-            f["value"] = value
+            await _set_value(page, f, choice)
+            f["value"] = choice
         except Exception as e:
             s.errors.append(f"Couldn't set “{f['label'][:60]}”: {str(e).splitlines()[0][:120]}")
 
@@ -309,15 +349,41 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
             await answers.remember(s.owner, s.job.get("company", ""), s.learn)
             return
     problems = await page.evaluate(
-        """() => [...document.querySelectorAll('[aria-invalid=true], .error, .field-error, [class*="error" i]')]
-             .map(e => (e.innerText || e.getAttribute('aria-label') || '').trim())
-             .filter(t => t && t.length < 200).slice(0, 8)"""
+        """() => {
+          const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+          const labelNear = (el) => {
+            const q = el.closest('.application-question, .field, [class*="field"], fieldset, label');
+            const lab = q?.querySelector('.application-label, legend, label, [class*="label" i]');
+            return clean(lab?.innerText || '').replace(/\\s*[*✱]\\s*$/, '').slice(0, 80);
+          };
+          const out = [];
+          for (const e of document.querySelectorAll('[aria-invalid=true], .error, .field-error, [class*="error" i], [class*="invalid" i]')) {
+            let t = clean(e.innerText || e.getAttribute('aria-label') || '');
+            if (!t || t.length > 200) continue;
+            if (/^(select|choose)([.…\\s].*)?$/i.test(t)) {
+              const lab = labelNear(e);
+              t = lab ? `${lab}: choose an option` : 'A required dropdown is still on Select…';
+            }
+            if (t && !out.includes(t)) out.push(t);
+            if (out.length >= 8) break;
+          }
+          return out;
+        }"""
     )
-    s.errors += [p for p in dict.fromkeys(problems)]
-    if await page.locator("iframe[src*='hcaptcha'], iframe[src*='recaptcha']").count() and not problems:
+    left = await page.evaluate(qr.REQUIRED_LEFT_JS)
+    for lab in left or []:
+        msg = f"{lab}: still required"
+        if msg not in problems:
+            problems.append(msg)
+    s.errors += [p for p in dict.fromkeys(problems) if p and not _PLACEHOLDER.match(p)]
+    if await page.locator("iframe[src*='hcaptcha'], iframe[src*='recaptcha']").count() and not s.errors:
         s.errors.append("The site may be asking for a CAPTCHA — finish on the company site.")
     s.screenshot = await _shot(page)
     s.fields = await _collect(page)
+    # Clear placeholder-looking values so the UI highlights them as blank.
+    for f in s.fields:
+        if _PLACEHOLDER.match(str(f.get("value") or "").strip()):
+            f["value"] = ""
     s.status = "error"
     s.detail = "The form didn't confirm the submission. Fix the highlighted answers and try again."
 

@@ -275,14 +275,21 @@ COLLECT_FIELDS_JS = r"""
     if (!visible(el)) continue;
     el.setAttribute('data-il', String(idx));
     const combo = el.getAttribute('role') === 'combobox' || !!el.closest('.select__control, [class*="select__control"]');
-    const chosen = combo ? clean(el.closest('.select__control, [class*="select__control"]')?.querySelector('[class*="single-value"], [class*="multi-value"]')?.innerText || '') : '';
+    let chosen = combo ? clean(el.closest('.select__control, [class*="select__control"]')?.querySelector('[class*="single-value"], [class*="multi-value"]')?.innerText || '') : '';
+    // react-select placeholders ("Select…") are not real answers
+    if (/^select(\b|[.…\s]|$)/i.test(chosen) || /^choose(\b|[.…\s]|$)/i.test(chosen)) chosen = '';
+    let selectVal = '';
+    if (el.tagName === 'SELECT' && el.selectedIndex >= 0) {
+      const t = clean(el.options[el.selectedIndex]?.text || '');
+      if (t && !/^select(\b|[.…\s]|$)/i.test(t) && el.selectedIndex > 0) selectVal = t;
+    }
     out.push({
       idx: idx++,
       kind: combo ? 'combobox' : el.tagName === 'SELECT' ? 'select' : el.tagName === 'TEXTAREA' ? 'textarea' : type,
       label: labelFor(el).slice(0, 300),
-      value: combo ? chosen : el.tagName === 'SELECT' ? (el.selectedIndex > 0 ? el.value : '') : (type === 'checkbox' ? (el.checked ? 'on' : '') : el.value),
+      value: combo ? chosen : el.tagName === 'SELECT' ? selectVal : (type === 'checkbox' ? (el.checked ? 'on' : '') : el.value),
       required: el.required || el.getAttribute('aria-required') === 'true' || /\*\s*$/.test(labelFor(el)),
-      options: el.tagName === 'SELECT' ? [...el.options].slice(1).map((o) => clean(o.text)) : [],
+      options: el.tagName === 'SELECT' ? [...el.options].filter((o) => o.value !== '' && !/^select(\b|[.…\s]|$)/i.test(clean(o.text))).map((o) => clean(o.text)) : [],
     });
   }
   const radios = [...radioGroups.values()].map((opts) => ({ question: opts[0].question, opts, answered: opts.some((o) => o.checked) }));
@@ -312,7 +319,15 @@ REQUIRED_LEFT_JS = r"""
       empty = !el.checked;
     } else {
       const ctl = el.closest('.select__control, [class*="select__control"]');
-      empty = ctl ? !ctl.querySelector('[class*="single-value"], [class*="multi-value"]') : !el.value;
+      if (ctl) {
+        const picked = clean(ctl.querySelector('[class*="single-value"], [class*="multi-value"]')?.innerText || '');
+        empty = !picked || /^select(\b|[.…\s]|$)/i.test(picked) || /^choose(\b|[.…\s]|$)/i.test(picked);
+      } else if (el.tagName === 'SELECT') {
+        const t = clean(el.options[el.selectedIndex]?.text || '');
+        empty = el.selectedIndex <= 0 || !t || /^select(\b|[.…\s]|$)/i.test(t);
+      } else {
+        empty = !el.value;
+      }
       if (el.getBoundingClientRect().width === 0 && !ctl) continue;
     }
     const lab = labelOf(el);
