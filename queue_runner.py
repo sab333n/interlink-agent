@@ -239,10 +239,12 @@ COLLECT_FIELDS_JS = r"""
       const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
       if (l) return clean(l.innerText);
     }
+    const gh = el.closest('.field, .field--text, .field--select, [class*="field"]')?.querySelector('label .label, label, .label, .application--label');
+    if (gh && clean(gh.innerText) && clean(gh.innerText).length < 280) return clean(gh.innerText);
     const lever = el.closest('.application-question')?.querySelector('.application-label');
     if (lever) return clean(lever.innerText);
     const wrap = el.closest('label');
-    if (wrap && clean(wrap.innerText)) return clean(wrap.innerText);
+    if (wrap && clean(wrap.innerText) && clean(wrap.innerText).length < 280) return clean(wrap.innerText);
     const by = el.getAttribute('aria-labelledby');
     if (by) {
       const t = by.split(/\s+/).map((id) => document.getElementById(id)?.innerText || '').join(' ');
@@ -274,7 +276,9 @@ COLLECT_FIELDS_JS = r"""
   for (const el of document.querySelectorAll('input, textarea, select')) {
     const type = (el.getAttribute('type') || el.tagName).toLowerCase();
     if (['hidden', 'submit', 'button', 'image', 'reset', 'file', 'search'].includes(type)) continue;
-    if (el.disabled || el.readOnly) continue;
+    if (el.disabled) continue;
+    // Keep empty readOnly out; filled locked fields (e.g. email) can be skipped.
+    if (el.readOnly && (el.value || '').trim()) continue;
     if (type === 'radio') {
       if (!visible(el) && !visible(el.parentElement || el)) continue;
       const g = el.name || labelFor(el);
@@ -315,37 +319,48 @@ REQUIRED_LEFT_JS = r"""
 () => {
   const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
   const labelOf = (el) => {
+    const gh = el.closest('.field, .field--text, .field--select, [class*="field"]')?.querySelector('label, .label, .application--label');
+    if (gh && clean(gh.innerText)) return clean(gh.innerText).replace(/\s*[*✱]\s*$/, '').slice(0, 120);
     const lever = el.closest('.application-question')?.querySelector('.application-label');
-    if (lever) return clean(lever.innerText).replace(/\s*✱$/, '').slice(0, 80);
+    if (lever) return clean(lever.innerText).replace(/\s*[*✱]\s*$/, '').slice(0, 120);
     const l = el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-    return clean(l?.innerText || el.getAttribute('aria-label') || el.closest('fieldset')?.querySelector('legend')?.innerText || el.name).slice(0, 80);
+    return clean(l?.innerText || el.getAttribute('aria-label') || el.closest('fieldset')?.querySelector('legend')?.innerText || el.name).replace(/\s*[*✱]\s*$/, '').slice(0, 120);
+  };
+  const isEmpty = (el) => {
+    if (el.type === 'checkbox') return !el.checked;
+    const ctl = el.closest('.select__control, [class*="select__control"]');
+    if (ctl || el.getAttribute('role') === 'combobox') {
+      const root = ctl || el.closest('[class*="select"]') || el.parentElement;
+      const picked = clean(root?.querySelector('[class*="single-value"], [class*="multi-value"]')?.innerText || '');
+      return !picked || /^select(\b|[.…\s]|$)/i.test(picked) || /^choose(\b|[.…\s]|$)/i.test(picked);
+    }
+    if (el.tagName === 'SELECT') {
+      const t = clean(el.options[el.selectedIndex]?.text || '');
+      return el.selectedIndex <= 0 || !t || /^select(\b|[.…\s]|$)/i.test(t);
+    }
+    return !(el.value || '').trim();
   };
   const seen = new Set();
   const left = [];
-  for (const el of document.querySelectorAll('input[required], textarea[required], select[required], [aria-required=true]')) {
-    if (el.type === 'hidden' || el.type === 'file') continue;
-    let empty;
-    if (el.type === 'radio') {
-      if (seen.has(el.name)) continue;
-      seen.add(el.name);
-      empty = !document.querySelector(`input[name="${CSS.escape(el.name)}"]:checked`);
-    } else if (el.type === 'checkbox') {
-      empty = !el.checked;
-    } else {
-      const ctl = el.closest('.select__control, [class*="select__control"]');
-      if (ctl) {
-        const picked = clean(ctl.querySelector('[class*="single-value"], [class*="multi-value"]')?.innerText || '');
-        empty = !picked || /^select(\b|[.…\s]|$)/i.test(picked) || /^choose(\b|[.…\s]|$)/i.test(picked);
-      } else if (el.tagName === 'SELECT') {
-        const t = clean(el.options[el.selectedIndex]?.text || '');
-        empty = el.selectedIndex <= 0 || !t || /^select(\b|[.…\s]|$)/i.test(t);
-      } else {
-        empty = !el.value;
-      }
-      if (el.getBoundingClientRect().width === 0 && !ctl) continue;
-    }
+  for (const el of document.querySelectorAll('input, textarea, select, [role=combobox]')) {
+    const type = (el.getAttribute('type') || el.tagName).toLowerCase();
+    if (['hidden', 'submit', 'button', 'image', 'reset', 'file', 'search'].includes(type)) continue;
+    if (el.disabled) continue;
     const lab = labelOf(el);
-    if (empty && lab && !/^cards\[/.test(lab) && !left.includes(lab)) left.push(lab);
+    const req = el.required || el.getAttribute('aria-required') === 'true'
+      || /\*|✱/.test(lab)
+      || !!(el.closest('.field, .application-question')?.querySelector('.asterisk, .required, [aria-hidden]'));
+    if (!req) continue;
+    if (type === 'radio') {
+      if (!el.name || seen.has(el.name)) continue;
+      seen.add(el.name);
+      if (document.querySelector(`input[name="${CSS.escape(el.name)}"]:checked`)) continue;
+    } else if (!isEmpty(el)) {
+      continue;
+    }
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0 && !el.closest('.select__control, [class*="select__control"]')) continue;
+    if (lab && !/^cards\[/.test(lab) && !left.includes(lab)) left.push(lab);
   }
   return left;
 }

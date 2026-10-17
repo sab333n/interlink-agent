@@ -296,12 +296,131 @@ async def _set_value(page: Page, field: dict, value: str) -> None:
         await loc.fill(choice, timeout=4000)
 
 
+def _norm_label(label: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"\s*[*✱]\s*$", "", label or "").strip().lower())
+
+
+def _find_field(fields: list[dict[str, Any]], label: str) -> Optional[dict[str, Any]]:
+    want = _norm_label(label)
+    if not want:
+        return None
+    for f in fields:
+        have = _norm_label(f.get("label") or "")
+        if have == want or have.startswith(want[:48]) or want.startswith(have[:48]):
+            return f
+    for f in fields:
+        have = _norm_label(f.get("label") or "")
+        if want in have or have in want:
+            return f
+    return None
+
+
+async def _scroll_form(page: Page) -> None:
+    try:
+        await page.evaluate(
+            """async () => {
+              const step = Math.max(300, Math.floor(window.innerHeight * 0.7));
+              for (let y = 0; y < document.body.scrollHeight; y += step) {
+                window.scrollTo(0, y);
+                await new Promise((r) => setTimeout(r, 80));
+              }
+              window.scrollTo(0, 0);
+            }"""
+        )
+    except Exception:
+        pass
+
+
+async def _apply_hints_to_page(
+    page: Page, fields: list[dict[str, Any]], hints: dict[str, dict[str, str]]
+) -> int:
+    n = 0
+    for fid, hint in hints.items():
+        field = next((f for f in fields if f["id"] == fid), None)
+        if not field:
+            continue
+        answer = hint["answer"]
+        field["suggested"], field["source"] = answer, hint["source"]
+        if not str(field.get("value") or "").strip():
+            field["value"] = answer
+        try:
+            await _set_value(page, field, answer)
+            field["value"] = answer
+            n += 1
+        except Exception as e:
+            print(f"  ! auto-fill “{field.get('label', '')[:50]}”: {e}", flush=True)
+    return n
+
+
+async def _fill_required_gaps(page: Page, s: Session, profile: dict) -> int:
+    """Find anything the employer still marks required and fill from profile/fallbacks."""
+    await _scroll_form(page)
+    fields = await _collect(page)
+    await _refresh_select_options(page, fields)
+    # Index by current ids for suggest.
+    s.fields = fields
+    hints = await answers.suggest(
+        [f for f in fields if not str(f.get("value") or "").strip()],
+        s.job,
+        profile,
+        s.owner,
+    )
+    filled = await _apply_hints_to_page(page, fields, hints)
+
+    left = await page.evaluate(qr.REQUIRED_LEFT_JS) or []
+    fields = await _collect(page)
+    await _refresh_select_options(page, [f for f in fields if not str(f.get("value") or "").strip()])
+    for lab in left:
+        field = _find_field(fields, lab)
+        if not field:
+            # Synthesize a minimal field so fallbacks still run after we locate the control.
+            continue
+        if str(field.get("value") or "").strip() and not _PLACEHOLDER.match(str(field.get("value"))):
+            continue
+        hint = answers._fallback(field, s.job, profile)
+        if not hint:
+            # Last resort for yes/no-looking labels.
+            yn = answers._yn_from_profile(_norm_label(lab), profile)
+            if yn and field.get("options"):
+                pick = answers._pick_yes_no(field["options"], yn)
+                if pick:
+                    hint = {"answer": pick, "source": "fact"}
+            elif yn:
+                hint = {"answer": yn.capitalize(), "source": "fact"}
+        if not hint:
+            continue
+        answer = answers._clean(field, hint["answer"]) or hint["answer"]
+        try:
+            await _set_value(page, field, answer)
+            field["value"] = answer
+            field["suggested"] = answer
+            field["source"] = hint["source"]
+            filled += 1
+            print(f"  ✓ gap “{lab[:60]}” → {answer[:80]}", flush=True)
+        except Exception as e:
+            print(f"  ! gap “{lab[:50]}”: {e}", flush=True)
+    s.fields = await _collect(page)
+    # Carry suggestions onto the fresh collect for the review UI.
+    by_label = {_norm_label(f["label"]): f for f in fields if f.get("suggested")}
+    for f in s.fields:
+        prev = by_label.get(_norm_label(f["label"]))
+        if prev and not str(f.get("value") or "").strip():
+            f["value"] = prev.get("value") or prev.get("suggested") or ""
+            f["suggested"] = prev.get("suggested") or f["value"]
+            f["source"] = prev.get("source")
+        elif prev and prev.get("suggested"):
+            f["suggested"] = prev["suggested"]
+            f["source"] = prev.get("source")
+            if not str(f.get("value") or "").strip():
+                f["value"] = prev["suggested"]
+    return filled
+
+
 async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
     url = (s.job.get("apply_url") or "").strip()
     if not url:
         s.status, s.detail = "unsupported", "This listing has no application link."
         return
-    filled = False
     async with _fill_lock:
         _use_profile(profile, resume)
         s.context = await _new_context()
@@ -320,48 +439,92 @@ async def _prepare(s: Session, profile: dict, resume: Optional[Path]) -> None:
             if not ok:
                 s.status, s.detail = "blocked", detail
                 return
-            s.fields = await _collect(page)
             s.detail = detail
-            filled = True
+            s.status = "answering"
+            await _scroll_form(page)
+            s.fields = await _collect(page)
+            await _refresh_select_options(page, s.fields)
+            hints = await answers.suggest(s.fields, s.job, profile, s.owner)
+            n = await _apply_hints_to_page(page, s.fields, hints)
+            print(f"  · applied {n} suggested answers to the live form", flush=True)
+            gaps = await _fill_required_gaps(page, s, profile)
+            print(f"  · filled {gaps} required gaps", flush=True)
+            s.screenshot = await _shot(page)
+            s.status = "ready"
         except Exception as e:
             s.status, s.detail = "error", f"{type(e).__name__}: {e}"[:300]
             s.screenshot = await _shot(page)
-    if filled:
-        s.status = "answering"
-        await _refresh_select_options(page, s.fields)
-        for fid, hint in (await answers.suggest(s.fields, s.job, profile, s.owner)).items():
-            field = next(f for f in s.fields if f["id"] == fid)
-            field["suggested"], field["source"] = hint["answer"], hint["source"]
-            # Also stamp onto value so the review UI and re-submit both see it.
-            if not str(field.get("value") or "").strip():
-                field["value"] = hint["answer"]
-        s.status = "ready"
 
 
 async def _submit(s: Session, answers_in: dict[str, str]) -> None:
     page = s.page
     assert page is not None
     s.status, s.errors = "submitting", []
+    # Re-collect so data-il indexes match the live DOM after earlier fills.
+    s.fields = await _collect(page)
+    await _refresh_select_options(page, s.fields)
     by_id = {f["id"]: f for f in s.fields}
-    s.learn = [(by_id[fid]["label"], {"true": "yes"}.get(v, v)) for fid, v in answers_in.items()
-               if fid in by_id and by_id[fid]["kind"] != "file" and _real_choice(v, by_id[fid].get("options") or [])
-               and not str(by_id[fid]["value"]).strip()]
+
+    # Map incoming answers (possibly keyed to older field ids) onto current fields by label.
+    mapped: list[tuple[dict[str, Any], str]] = []
     for fid, value in answers_in.items():
         f = by_id.get(fid)
-        if not f or f["kind"] == "file":
+        if not f:
             continue
+        mapped.append((f, value))
+    # Also accept any suggested/value already on fields the UI didn't send.
+    for f in s.fields:
+        if f["kind"] == "file":
+            continue
+        if any(f["id"] == m[0]["id"] for m in mapped):
+            continue
+        raw = str(f.get("value") or f.get("suggested") or "").strip()
+        if raw:
+            mapped.append((f, raw))
+
+    s.learn = []
+    for f, value in mapped:
         choice = _real_choice(value, f.get("options") or [])
         if choice is None:
-            if f.get("required"):
-                s.errors.append(f"“{f['label'][:80]}” still needs an option (not Select…).")
             continue
-        if choice == f.get("value"):
-            continue
+        s.learn.append((f["label"], {"true": "yes"}.get(choice, choice)))
         try:
             await _set_value(page, f, choice)
             f["value"] = choice
         except Exception as e:
             s.errors.append(f"Couldn't set “{f['label'][:60]}”: {str(e).splitlines()[0][:120]}")
+
+    # Final automatic pass for anything still required on the employer form.
+    profile = qr.PROFILE
+    await _fill_required_gaps(page, s, profile)
+
+    left = await page.evaluate(qr.REQUIRED_LEFT_JS) or []
+    if left:
+        # One more suggest pass for stubborn blanks.
+        s.fields = await _collect(page)
+        await _refresh_select_options(page, s.fields)
+        hints = await answers.suggest(
+            [f for f in s.fields if not str(f.get("value") or "").strip()],
+            s.job,
+            profile,
+            s.owner,
+        )
+        await _apply_hints_to_page(page, s.fields, hints)
+        left = await page.evaluate(qr.REQUIRED_LEFT_JS) or []
+
+    if left:
+        s.errors += [f"{lab}: still required" for lab in left]
+        s.screenshot = await _shot(page)
+        s.fields = await _collect(page)
+        for f in s.fields:
+            if _PLACEHOLDER.match(str(f.get("value") or "").strip()):
+                f["value"] = ""
+        s.status = "error"
+        s.detail = (
+            "Some required employer questions are still blank after auto-fill. "
+            "Edit the highlighted answers below and try again."
+        )
+        return
 
     clicked = False
     for sel in ["button:has-text('Submit application')", "button:has-text('Submit Application')",
@@ -413,8 +576,8 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
           return out;
         }"""
     )
-    left = await page.evaluate(qr.REQUIRED_LEFT_JS)
-    for lab in left or []:
+    left = await page.evaluate(qr.REQUIRED_LEFT_JS) or []
+    for lab in left:
         msg = f"{lab}: still required"
         if msg not in problems:
             problems.append(msg)
@@ -423,7 +586,6 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
         s.errors.append("The site may be asking for a CAPTCHA — finish on the company site.")
     s.screenshot = await _shot(page)
     s.fields = await _collect(page)
-    # Clear placeholder-looking values so the UI highlights them as blank.
     for f in s.fields:
         if _PLACEHOLDER.match(str(f.get("value") or "").strip()):
             f["value"] = ""
