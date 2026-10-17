@@ -251,6 +251,37 @@ async def _refresh_select_options(page: Page, fields: list[dict[str, Any]]) -> N
 
 async def _set_value(page: Page, field: dict, value: str) -> None:
     kind = field["kind"]
+    label = str(field.get("label") or "")
+    # File / resume controls are attached separately — never .fill() them.
+    if kind == "file" or re.search(r"^\s*resume\b|^\s*cv\b|attach.*(resume|cv)", label, re.I):
+        rp = qr.resume_path()
+        if not rp:
+            return
+        loc = page.locator("input[type=file]").first
+        if field.get("id") not in ("", None, "resume"):
+            try:
+                loc = page.locator(f"[data-il='{field['id']}']")
+            except Exception:
+                pass
+        # Prefer the resume-named file input when multiple exist.
+        inputs = page.locator("input[type=file]")
+        n = await inputs.count()
+        target = None
+        for i in range(n):
+            meta = await inputs.nth(i).evaluate(
+                "el => (el.name + ' ' + el.id + ' ' + (el.closest('div,fieldset,label')?.innerText || '')).toLowerCase()"
+            )
+            if "cover" in meta:
+                continue
+            target = inputs.nth(i)
+            if "resume" in meta or "cv" in meta:
+                break
+        if target is None:
+            target = loc
+        await target.set_input_files(str(rp))
+        await asyncio.sleep(1.0)
+        return
+
     opts = list(field.get("options") or [])
     choice = _real_choice(value, opts)
     if kind != "checkbox" and choice is None:
@@ -264,24 +295,50 @@ async def _set_value(page: Page, field: dict, value: str) -> None:
         try:
             await loc.select_option(label=choice, timeout=4000)
         except Exception:
-            # Some Greenhouse selects match on value, not visible label.
-            await loc.select_option(label=re.compile(re.escape(choice), re.I), timeout=4000)
+            try:
+                await loc.select_option(label=re.compile(re.escape(choice), re.I), timeout=4000)
+            except Exception:
+                # Fall back to value attribute match.
+                await loc.select_option(value=re.compile(re.escape(choice), re.I), timeout=4000)
     elif kind == "checkbox":
         await (loc.check if value else loc.uncheck)(timeout=4000)
     elif kind == "combobox":
         iid = await loc.get_attribute("id")
-        sel = f'[id^="react-select-{iid}-option"]' if iid else "[role=option]"
-        control = loc.locator("xpath=ancestor::*[contains(@class,'select__control') or contains(@class,'Select')][1]")
-        try:
-            if await control.count():
-                await control.first.click(timeout=3000)
-            else:
-                await loc.click(timeout=3000)
-        except Exception:
+        sel = (
+            f'[id^="react-select-{iid}-option"], #{iid}-listbox [role=option], [role=listbox] [role=option]'
+            if iid
+            else "[role=listbox] [role=option], [role=option]"
+        )
+        # Click the visible control, not only the hidden input.
+        clicked = False
+        for sel_ctl in [
+            f"#{iid}",
+            f"[data-il='{field['id']}']",
+        ]:
+            try:
+                el = page.locator(sel_ctl).first
+                box = el.locator(
+                    "xpath=ancestor-or-self::*[contains(@class,'select__control') or contains(@class,'select-container') or contains(@class,'Select')][1]"
+                )
+                if await box.count():
+                    await box.first.click(timeout=2500)
+                    clicked = True
+                    break
+                await el.click(timeout=2500)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
             await loc.focus(timeout=4000)
-        await loc.fill("", timeout=4000)
-        await loc.fill(choice, timeout=4000)
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.2)
+        try:
+            await loc.fill("", timeout=2000)
+            await loc.fill(choice, timeout=3000)
+        except Exception:
+            # Some Greenhouse comboboxes are not fillable — type via keyboard.
+            await page.keyboard.type(choice, delay=20)
+        await asyncio.sleep(0.9)
         exact = re.compile(r"^\s*" + re.escape(choice) + r"\s*$", re.I)
         opt = page.locator(sel).filter(has_text=exact)
         if await opt.count() == 0:
@@ -289,10 +346,20 @@ async def _set_value(page: Page, field: dict, value: str) -> None:
         if await opt.count() == 0:
             opt = page.locator(sel)
         if await opt.count() == 0:
+            await page.keyboard.press("ArrowDown")
+            await asyncio.sleep(0.2)
             await page.keyboard.press("Enter")
         else:
             await opt.first.click(timeout=4000)
+        await page.keyboard.press("Escape")
     else:
+        # Never .fill() a file input that slipped through with kind=input.
+        tag = await loc.evaluate("e => (e.tagName + ':' + (e.type || '')).toLowerCase()")
+        if "file" in tag:
+            rp = qr.resume_path()
+            if rp:
+                await loc.set_input_files(str(rp))
+            return
         await loc.fill(choice, timeout=4000)
 
 
@@ -337,7 +404,7 @@ async def _apply_hints_to_page(
     n = 0
     for fid, hint in hints.items():
         field = next((f for f in fields if f["id"] == fid), None)
-        if not field:
+        if not field or field.get("kind") == "file":
             continue
         answer = hint["answer"]
         field["suggested"], field["source"] = answer, hint["source"]
@@ -374,6 +441,8 @@ async def _fill_required_gaps(page: Page, s: Session, profile: dict) -> int:
         field = _find_field(fields, lab)
         if not field:
             # Synthesize a minimal field so fallbacks still run after we locate the control.
+            continue
+        if field.get("kind") == "file":
             continue
         if str(field.get("value") or "").strip() and not _PLACEHOLDER.match(str(field.get("value"))):
             continue
@@ -469,12 +538,12 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
     mapped: list[tuple[dict[str, Any], str]] = []
     for fid, value in answers_in.items():
         f = by_id.get(fid)
-        if not f:
+        if not f or f.get("kind") == "file":
             continue
         mapped.append((f, value))
     # Also accept any suggested/value already on fields the UI didn't send.
     for f in s.fields:
-        if f["kind"] == "file":
+        if f.get("kind") == "file":
             continue
         if any(f["id"] == m[0]["id"] for m in mapped):
             continue
@@ -482,8 +551,16 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
         if raw:
             mapped.append((f, raw))
 
+    # Ensure resume stays attached (Greenhouse sometimes clears it on re-render).
+    try:
+        await _set_value(page, {"id": "resume", "kind": "file", "label": "Resume"}, "resume")
+    except Exception as e:
+        print(f"  ! resume re-attach: {e}", flush=True)
+
     s.learn = []
     for f, value in mapped:
+        if f.get("kind") == "file":
+            continue
         choice = _real_choice(value, f.get("options") or [])
         if choice is None:
             continue
@@ -492,7 +569,12 @@ async def _submit(s: Session, answers_in: dict[str, str]) -> None:
             await _set_value(page, f, choice)
             f["value"] = choice
         except Exception as e:
-            s.errors.append(f"Couldn't set “{f['label'][:60]}”: {str(e).splitlines()[0][:120]}")
+            msg = str(e).splitlines()[0][:120]
+            # Don't surface file-input fill noise as a user-facing blocker.
+            if "Locator.fill" in msg and re.search(r"resume|file", f.get("label", ""), re.I):
+                print(f"  ! skip resume fill noise: {msg}", flush=True)
+                continue
+            s.errors.append(f"Couldn't set “{f['label'][:60]}”: {msg}")
 
     # Final automatic pass for anything still required on the employer form.
     profile = qr.PROFILE
