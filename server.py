@@ -55,6 +55,10 @@ import imessage  # noqa: E402
 from extension import router as extension_router  # noqa: E402
 from tailor import router as tailor_router  # noqa: E402
 import alerts  # noqa: E402
+from jobs import router as jobs_router  # noqa: E402
+from alumni_api import router as alumni_router  # noqa: E402
+from interview import router as interview_router  # noqa: E402
+from api_anything import router as api_anything_router  # noqa: E402
 from auth import auth_required  # noqa: E402
 
 # Hosted, the agent serves many users, so the single shared local queue (which
@@ -76,6 +80,10 @@ app.include_router(imessage.router)
 app.include_router(extension_router)
 app.include_router(tailor_router)
 app.include_router(alerts.router)
+app.include_router(jobs_router)
+app.include_router(alumni_router)
+app.include_router(interview_router)
+app.include_router(api_anything_router)
 
 
 @app.on_event("startup")
