@@ -12,7 +12,14 @@ services:
         sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: AGENT_ALLOWED_ORIGINS
+        sync: false
+      # LLM: the first key set wins (Groq, then Gemini, OpenAI, xAI)
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
         sync: false
       - key: XAI_API_KEY
         sync: false

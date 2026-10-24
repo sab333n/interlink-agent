@@ -18,8 +18,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import chat
-from auth import require_user
+import routes.chat as chat
+from services.auth import require_user
+from services.posthog_client import get_posthog_client
 
 router = APIRouter(prefix="/api/tailor")
 
@@ -252,7 +253,11 @@ def _fallback_jakes(profile: dict[str, Any], job: dict[str, Any]) -> dict[str, A
 
 
 @router.post("")
-async def tailor(req: TailorRequest, _: str = Depends(require_user)) -> dict[str, Any]:
+async def tailor(
+    req: TailorRequest,
+    _: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+) -> dict[str, Any]:
     cfg = chat.llm_config()
     if not cfg:
         raise HTTPException(503, "No model API key configured on the agent server.")
@@ -307,6 +312,14 @@ async def tailor(req: TailorRequest, _: str = Depends(require_user)) -> dict[str
         raise HTTPException(502, f"Tailor failed: {str(e)[:200]}") from None
     if not out["resume_text"] and not out["cover_letter"]:
         raise HTTPException(502, "The model returned an empty rewrite. Try again.")
+    if posthog_client:
+        posthog_client.capture(
+            "resume_tailored",
+            properties={
+                "includes_resume": bool(out["resume_text"]),
+                "includes_cover_letter": bool(out["cover_letter"]),
+            },
+        )
     return out
 
 
@@ -316,5 +329,13 @@ class CoverOnlyRequest(BaseModel):
 
 
 @router.post("/cover")
-async def cover_only(req: CoverOnlyRequest, user: str = Depends(require_user)) -> dict[str, Any]:
-    return await tailor(TailorRequest(job=req.job, profile=req.profile, want_resume=False, want_cover=True), user)
+async def cover_only(
+    req: CoverOnlyRequest,
+    user: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+) -> dict[str, Any]:
+    return await tailor(
+        TailorRequest(job=req.job, profile=req.profile, want_resume=False, want_cover=True),
+        user,
+        posthog_client,
+    )

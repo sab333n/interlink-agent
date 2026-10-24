@@ -16,7 +16,7 @@ import time
 from typing import Any, Optional
 from urllib.request import Request, urlopen
 
-import freehire as freehire_client
+import services.freehire as freehire_client
 
 SIMPLIFY_README = (
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/README.md"

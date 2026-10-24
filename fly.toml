@@ -4,6 +4,10 @@ primary_region = "ord"
 [build]
   dockerfile = "Dockerfile"
 
+# The Dockerfile defaults PORT to 7860 (Hugging Face); Fly routes to internal_port.
+[env]
+  PORT = "8080"
+
 [http_service]
   internal_port = 8080
   force_https = true

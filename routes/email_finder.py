@@ -28,7 +28,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth import require_user  # noqa: E402
+from services.auth import require_user  # noqa: E402
 
 router = APIRouter(prefix="/api/email", dependencies=[Depends(require_user)])
 

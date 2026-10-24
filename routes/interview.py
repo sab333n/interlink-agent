@@ -11,8 +11,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from auth import require_user
-from chat import llm_config
+from services.auth import require_user
+from routes.chat import llm_config
+from services.posthog_client import get_posthog_client
 
 router = APIRouter(prefix="/api/interview")
 BANK = [
@@ -57,7 +58,11 @@ def bank(_user_id: str = Depends(require_user)):
 
 
 @router.post("/coach")
-async def coach(req: CoachRequest, _user_id: str = Depends(require_user)):
+async def coach(
+    req: CoachRequest,
+    _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     cfg = llm_config()
     if not cfg:
         raise HTTPException(503, "No LLM API key configured (GROQ_API_KEY / OPENAI_API_KEY / XAI_API_KEY).")
@@ -90,6 +95,12 @@ async def coach(req: CoachRequest, _user_id: str = Depends(require_user)):
         data = json.loads(raw)
     except Exception as e:
         raise HTTPException(502, f"Coach model failed: {e}") from e
+
+    if posthog_client:
+        posthog_client.capture(
+            "interview_answer_coached",
+            properties={"category": req.category or "unspecified", "answer_length": len(req.answer)},
+        )
 
     return {
         "ok": True,

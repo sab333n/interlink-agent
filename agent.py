@@ -11,44 +11,53 @@ from playwright.async_api import Page, TimeoutError as PWTimeout, async_playwrig
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env")
 
-# ── Grok client (uses OpenAI-compatible API) ──
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-3-mini")
-_grok_client: OpenAI | None = None
+# ── LLM client (any OpenAI-compatible API) ──
+# First provider whose key is set wins. AGENT_LLM_MODEL overrides the model.
+LLM_PROVIDERS = [
+    ("GROQ_API_KEY", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+    ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-3.8-flash"),
+    ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-4o-mini"),
+    ("XAI_API_KEY", "https://api.x.ai/v1", "grok-3-mini"),
+]
+LLM_MODEL = ""
+_llm_client: OpenAI | None = None
 
 
-def _grok() -> OpenAI | None:
-    global _grok_client
-    if _grok_client is None and os.getenv("XAI_API_KEY"):
-        _grok_client = OpenAI(api_key=os.getenv("XAI_API_KEY"), base_url="https://api.x.ai/v1")
-    return _grok_client
+def _llm() -> OpenAI | None:
+    global _llm_client, LLM_MODEL
+    if _llm_client is None:
+        for env_key, base_url, model in LLM_PROVIDERS:
+            key = os.getenv(env_key, "").strip()
+            if key:
+                _llm_client = OpenAI(api_key=key, base_url=base_url)
+                LLM_MODEL = os.getenv("AGENT_LLM_MODEL") or model
+                break
+    return _llm_client
+
+
+def llm_configured() -> bool:
+    return any(os.getenv(env_key, "").strip() for env_key, _, _ in LLM_PROVIDERS)
 
 
 def grok_complete(prompt: str, max_tokens: int = 200) -> str:
-    """Returns "" when no XAI_API_KEY is configured or the call fails."""
-    global XAI_MODEL
-    client = _grok()
+    """Returns "" when no LLM key is configured or the call fails."""
+    client = _llm()
     if client is None:
         return ""
+    # gpt-oss and Gemini count hidden reasoning against max_tokens, so give them
+    # headroom and keep reasoning short.
+    reasoning = "gpt-oss" in LLM_MODEL or "gemini" in LLM_MODEL
     try:
         resp = client.chat.completions.create(
-            model=XAI_MODEL,
+            model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
+            max_tokens=max_tokens + 800 if reasoning else max_tokens,
             temperature=0.2,
+            extra_body={"reasoning_effort": "low"} if reasoning else None,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        if "model" in str(e).lower():
-            try:
-                names = sorted(m.id for m in client.models.list().data if "grok" in m.id)
-                fallback = next((n for n in names if "mini" in n or "fast" in n), names[-1] if names else "")
-                if fallback and fallback != XAI_MODEL:
-                    print(f"  ! Model {XAI_MODEL} unavailable — switching to {fallback}")
-                    XAI_MODEL = fallback
-                    return grok_complete(prompt, max_tokens)
-            except Exception:
-                pass
-        print(f"  ! Grok call failed ({XAI_MODEL}): {e}")
+        print(f"  ! LLM call failed ({LLM_MODEL}): {e}")
         return ""
 
 # ── Load profile ──
@@ -96,6 +105,12 @@ AGENT_DRY_RUN = os.environ.get("AGENT_DRY_RUN", "1") == "1" and not AGENT_SUBMIT
 # "signin" = always try to sign in with existing credentials.
 WORKDAY_MODE = os.environ.get("WORKDAY_MODE", "auto").lower()
 WORKDAY_STEP_RETRY_BUDGET = 2
+WORKDAY_SUBMIT_SELECTORS = (
+    "button:has-text('Submit Application')",
+    "button:has-text('Submit')",
+    "button[type='submit']",
+    "input[type='submit']",
+)
 
 WORKDAY_PRIORITY_FIELD_SPECS = [
     {
@@ -174,6 +189,9 @@ QUESTION: {question}
 
 Answer with ONLY the value to type/select. No explanation. No quotes.
 If unsure, use the most appropriate value from the profile.
+Never claim facts the profile doesn't support (referrals, relatives at the company,
+clearances, certifications, prior employment there). For "how did you hear about us",
+pick a neutral source such as LinkedIn, Job Board or Company Website, not Referral.
 For yes/no questions, answer Yes or No.
 For dropdowns, give the exact option text to select.
 """
@@ -1864,7 +1882,10 @@ async def handle_workday_page(page: Page):
                 value = None
 
                 if inp_type == "password" or "password" in fl:
-                    value = PROFILE.get("ats_account_password") or os.environ.get("ATS_ACCOUNT_PASSWORD") or "InterLink!Apply$2026"
+                    value = PROFILE.get("ats_account_password") or os.environ.get("ATS_ACCOUNT_PASSWORD")
+                    if not value:
+                        print("  ! No ATS password set (profile ats_account_password or ATS_ACCOUNT_PASSWORD) — leaving password blank")
+                        continue
                 elif "extension" in fl or "ext." in fl or "ext " in fl:
                     # Phone extension: leave blank unless you actually have one
                     continue
@@ -2425,10 +2446,7 @@ async def handle_workday_page(page: Page):
             "button:has-text('Next')",
             "button:has-text('Review')",
             # Final submit (AGENT_DRY_RUN will skip these)
-            "button:has-text('Submit Application')",
-            "button:has-text('Submit')",
-            "button[type='submit']",
-            "input[type='submit']",
+            *WORKDAY_SUBMIT_SELECTORS,
         ]
 
         clicked_next = False
@@ -2464,13 +2482,15 @@ async def handle_workday_page(page: Page):
                     )
                     continue
 
-                # Only trip DRY RUN on terminal-submit-style buttons.
-                # We exclude "Save and Continue" and similar intermediate actions.
+                # Trip DRY RUN on anything that could submit the application:
+                # any "submit"/"send application" label, or a generic submit
+                # control whatever its label. Account sign-in/create buttons and
+                # "Save and Continue"-style navigation still go through.
                 label_lower = label_for_log.lower().strip()
-                is_final_submit = (
-                    label_lower in ("submit", "submit application", "send application")
-                    or "submit application" in label_lower
-                    or "submit my application" in label_lower
+                is_final_submit = sel not in account_gate and (
+                    sel in WORKDAY_SUBMIT_SELECTORS
+                    or "submit" in label_lower
+                    or "send application" in label_lower
                 )
                 if AGENT_DRY_RUN and is_final_submit:
                     print(f"  🛟  [DRY RUN] Stopping here — would click '{label_for_log}'")
@@ -2504,7 +2524,8 @@ async def handle_workday_page(page: Page):
                         )
                     else:
                         print("  ! Workday step did not advance after retries.")
-                    stuck_path = _ROOT / "stuck.png"
+                    stuck_path = _ROOT / "artifacts" / "stuck.png"
+                    stuck_path.parent.mkdir(parents=True, exist_ok=True)
                     await page.screenshot(path=str(stuck_path), full_page=True)
                     print(f"  Screenshot saved to {stuck_path}")
                     return False
@@ -2525,7 +2546,8 @@ async def handle_workday_page(page: Page):
                 return True
             else:
                 print("  ! Stuck — taking screenshot")
-                stuck_path = _ROOT / "stuck.png"
+                stuck_path = _ROOT / "artifacts" / "stuck.png"
+                stuck_path.parent.mkdir(parents=True, exist_ok=True)
                 await page.screenshot(path=str(stuck_path), full_page=True)
                 print(f"  Screenshot saved to {stuck_path}")
                 return False
@@ -2546,17 +2568,24 @@ async def handle_generic_form(page: Page):
         "input[name*='last_name' i], input[id*='last_name' i], input[placeholder*='last name' i]": PROFILE[
             "last_name"
         ],
+        # Lever and others ask for one full-name field
+        "input[name='name' i], input[autocomplete='name'], input[placeholder*='full name' i]": " ".join(
+            x for x in (PROFILE["first_name"], PROFILE["last_name"]) if x
+        ),
         "input[name*='email' i], input[id*='email' i], input[type='email']": PROFILE["email"],
         "input[name*='phone' i], input[id*='phone' i], input[type='tel']": PROFILE["phone"],
-        "input[name*='linkedin' i], input[id*='linkedin' i], input[placeholder*='linkedin' i]": PROFILE["linkedin"],
-        "input[name*='github' i], input[id*='github' i]": PROFILE["github"],
+        "input[name*='linkedin' i], input[id*='linkedin' i], input[placeholder*='linkedin' i], input[aria-label*='linkedin' i]": PROFILE["linkedin"],
+        "input[name*='github' i], input[id*='github' i], input[aria-label*='github' i]": PROFILE["github"],
         "input[name*='website' i], input[id*='website' i], input[name*='portfolio' i]": PROFILE["portfolio"],
     }
 
+    # Try each selector in turn until one fills
     for selector, value in field_map.items():
+        if not value:
+            continue
         for sel in selector.split(", "):
-            await fill_field(page, sel.strip(), value)
-            break
+            if await fill_field(page, sel.strip(), value):
+                break
 
     # Upload resume
     resume_path = next((p for p in RESUME_CANDIDATES if p.exists()), None)
@@ -2574,10 +2603,12 @@ async def handle_generic_form(page: Page):
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=2000):
                 st = (await btn.text_content() or "").strip()
-                print("  → Submitting...")
-                if AGENT_DRY_RUN and "submit" in st.lower():
-                    print("  [DRY RUN] Would submit here — skipping")
+                # Every selector above submits the form, whatever its label
+                # ("Apply", "Send application", ...), so dry run never clicks.
+                if AGENT_DRY_RUN:
+                    print(f"  [DRY RUN] Would click '{st or sel}' to submit — skipping")
                     return True
+                print("  → Submitting...")
                 await btn.click()
                 await asyncio.sleep(3)
                 return True
@@ -2750,7 +2781,8 @@ async def main():
 
         if not clicked:
             print("  ! Could not find Apply button. Taking screenshot...")
-            no_apply = _ROOT / "no_apply_btn.png"
+            no_apply = _ROOT / "artifacts" / "no_apply_btn.png"
+            no_apply.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(no_apply))
             await browser.close()
             return

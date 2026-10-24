@@ -14,9 +14,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth import require_user
-from imessage import load_chat, phone_for_user, save_chat, send_text
-from supa import admin_config, db
+from services.auth import require_user
+from routes.imessage import load_chat, phone_for_user, save_chat, send_text
+from services.supa import admin_config, db
 
 router = APIRouter(prefix="/api/alerts")
 
@@ -146,7 +146,7 @@ def start_background() -> None:
     if not admin_config():
         return
     # Same gate as iMessage: only the hosted instance should fire digests.
-    from auth import auth_required
+    from services.auth import auth_required
     if not (auth_required() or os.getenv("ALERTS_POLL", "").strip() == "1"):
         return
     asyncio.get_event_loop().create_task(poll_forever())

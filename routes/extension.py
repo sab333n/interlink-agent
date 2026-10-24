@@ -23,11 +23,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import BaseModel
 
-import answers
+import services.answers as answers
 import queue_runner as qr
-from auth import auth_required, require_user
-from imessage import download_resume, load_chat
-from supa import admin_config
+from services.auth import auth_required, require_user
+from routes.imessage import download_resume, load_chat
+from services.supa import admin_config
 
 router = APIRouter(prefix="/api/ext")
 

@@ -3,3 +3,7 @@ __pycache__/
 .inline-sessions/
 .agent-runs/
 *.log
+.venv/
+artifacts/
+profile.json
+resume.pdf

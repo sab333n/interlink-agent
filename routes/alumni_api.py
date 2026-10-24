@@ -12,7 +12,8 @@ import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from auth import require_user
+from services.auth import require_user
+from services.posthog_client import get_posthog_client
 
 router = APIRouter(prefix="/api/alumni")
 STOP = {
@@ -103,6 +104,7 @@ def alumni_search(
     company: str = Query(..., min_length=1),
     school: str = Query(""),
     _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
 ):
     key, cx = _cse_keys()
     if not key or not cx:
@@ -155,6 +157,12 @@ def alumni_search(
                 continue
             seen.add(url)
             people.append(person)
+
+    if posthog_client:
+        posthog_client.capture(
+            "alumni_search_completed",
+            properties={"result_count": len(people[:24]), "searched_with_school": bool(school)},
+        )
 
     return {
         "ok": True,

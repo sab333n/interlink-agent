@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py ./
+COPY . .
 # Hugging Face runs the container as uid 1000; sessions write temp files here.
 RUN chmod -R 777 /app
 

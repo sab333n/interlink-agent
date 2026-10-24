@@ -26,10 +26,10 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-import chat
-import inline_apply
-from supa import admin_config, db, db_headers as _db_headers, http
-from auth import auth_required, require_user
+import routes.chat as chat
+import routes.inline_apply as inline_apply
+from services.supa import admin_config, db, db_headers as _db_headers, http
+from services.auth import auth_required, require_user
 
 router = APIRouter(prefix="/api/imessage")
 

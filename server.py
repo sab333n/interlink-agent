@@ -19,7 +19,9 @@ Then click the "Run AI Agent" button on the jobs page.
 
 from __future__ import annotations
 
+import atexit
 import base64
+import logging
 import json
 import os
 import re
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
@@ -36,35 +39,121 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from posthog import Posthog
 from pydantic import BaseModel
 import uvicorn
 
+from dotenv import load_dotenv
+
+# Routes read API keys from os.environ; real env vars (deploys) still win.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from config import get_settings  # noqa: E402
+from services.posthog_logs import LOGGER_NAME, configure_posthog_log_capture
+
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+posthog_log = logging.getLogger(LOGGER_NAME)
 AGENT_SCRIPT = ROOT / "agent.py"
 QUEUE_SCRIPT = ROOT / "queue_runner.py"
 LOG_FILE = ROOT / "agent_run.log"
 
-app = FastAPI(title="InterLink AI Agent API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and cleanly shut down process-wide services."""
+    settings = get_settings()
+    posthog_client: Posthog | None = None
+    posthog_log_provider = None
 
-from inline_apply import router as inline_apply_router  # noqa: E402
-from email_finder import router as email_finder_router  # noqa: E402
-from chat import router as chat_router  # noqa: E402
-import imessage  # noqa: E402
-from extension import router as extension_router  # noqa: E402
-from tailor import router as tailor_router  # noqa: E402
-import alerts  # noqa: E402
-from jobs import router as jobs_router  # noqa: E402
-from alumni_api import router as alumni_router  # noqa: E402
-from interview import router as interview_router  # noqa: E402
-from api_anything import router as api_anything_router  # noqa: E402
-from auth import auth_required  # noqa: E402
+    if settings.posthog_project_token and settings.posthog_host:
+        posthog_client = Posthog(
+            settings.posthog_project_token,
+            host=settings.posthog_host,
+            enable_exception_autocapture=True,
+        )
+        app.state.posthog_client = posthog_client
+        atexit.register(posthog_client.shutdown)
+        _, posthog_log_provider = configure_posthog_log_capture(
+            settings.posthog_project_token, settings.posthog_host
+        )
+        posthog_log.info(
+            "PostHog log capture configured",
+            extra={"event": "posthog_log_capture_configured", "component": "agent_api"},
+        )
+    elif settings.debug:
+        missing_var = (
+            "POSTHOG_PROJECT_TOKEN"
+            if not settings.posthog_project_token
+            else "POSTHOG_HOST"
+        )
+        raise RuntimeError(
+            f"{missing_var} variable required by PostHog is missing or un-configured, "
+            f"this causes events to be silently missed. This error stops appearing once "
+            f"{missing_var} is configured"
+        )
+
+    imessage.start_background()
+    alerts.start_background()
+
+    try:
+        yield
+    finally:
+        if posthog_log_provider:
+            posthog_log.info(
+                "PostHog log capture stopping",
+                extra={"event": "posthog_log_capture_stopping", "component": "agent_api"},
+            )
+            posthog_log_provider.force_flush()
+            posthog_log_provider.shutdown()
+        if posthog_client:
+            posthog_client.flush()
+            posthog_client.shutdown()
+
+
+app = FastAPI(title="InterLink AI Agent API", lifespan=lifespan)
+
+
+from services.posthog_client import get_posthog_client  # noqa: E402
+from routes.inline_apply import router as inline_apply_router  # noqa: E402
+from routes.email_finder import router as email_finder_router  # noqa: E402
+from routes.chat import router as chat_router  # noqa: E402
+import routes.imessage as imessage  # noqa: E402
+from routes.extension import ext_user, router as extension_router  # noqa: E402
+from routes.tailor import router as tailor_router  # noqa: E402
+import routes.alerts as alerts  # noqa: E402
+from routes.jobs import router as jobs_router  # noqa: E402
+from routes.alumni_api import router as alumni_router  # noqa: E402
+from routes.interview import router as interview_router  # noqa: E402
+from routes.api_anything import router as api_anything_router  # noqa: E402
+from services.auth import auth_required, require_user  # noqa: E402
 
 # Hosted, the agent serves many users, so the single shared local queue (which
 # drives a visible browser on this machine) is switched off; in-site apply is used instead.
 HOSTED = auth_required()
 LOCAL_ONLY = {"/api/agent/run", "/api/agent/queue", "/api/agent/log", "/api/agent/stop"}
+
+
+@app.middleware("http")
+async def bind_posthog_identity(request: Request, call_next):
+    """Bind an authenticated user's stable ID to this request's PostHog context."""
+    posthog_client = get_posthog_client(request)
+    authorization = request.headers.get("authorization")
+    extension_token = request.headers.get("x-interlink-ext")
+    if not posthog_client or not auth_required() or not (authorization or extension_token):
+        return await call_next(request)
+
+    try:
+        user_id = (
+            await require_user(authorization)
+            if authorization
+            else await ext_user(extension_token)
+        )
+    except HTTPException:
+        # Let the endpoint's auth dependency return its normal response.
+        return await call_next(request)
+
+    with posthog_client.new_context():
+        posthog_client.identify_context(user_id)
+        return await call_next(request)
 
 
 @app.middleware("http")
@@ -85,11 +174,6 @@ app.include_router(alumni_router)
 app.include_router(interview_router)
 app.include_router(api_anything_router)
 
-
-@app.on_event("startup")
-async def _start_imessage() -> None:
-    imessage.start_background()
-    alerts.start_background()
 
 app.add_middleware(
     CORSMiddleware,
@@ -247,6 +331,13 @@ def run_agent(req: RunRequest):
             target=_reader_thread, args=(AgentState.proc, log_fh), daemon=True
         )
         t.start()
+        posthog_log.info(
+            "Agent run started",
+            extra={
+                "event": "agent_run_started",
+                "execution_mode": "dry_run" if req.dry_run is not False else "submit",
+            },
+        )
 
         return {
             "ok": True,
@@ -293,13 +384,22 @@ def run_queue(req: QueueRequest):
             log_fh.close()
             raise HTTPException(500, f"failed to start queue: {e}")
         threading.Thread(target=_reader_thread, args=(AgentState.proc, log_fh), daemon=True).start()
+        posthog_log.info(
+            "Agent queue started",
+            extra={"event": "agent_queue_started", "execution_mode": "dry_run"},
+        )
         return {"ok": True, "running": True, "message": f"Queue started with {len(req.jobs)} job(s)."}
+
+
+def llm_configured() -> bool:
+    """True when any LLM key the agent can use is set (see agent.LLM_PROVIDERS)."""
+    return any(os.environ.get(k, "").strip() for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"))
 
 
 @app.get("/api/agent/status")
 def agent_status():
     if HOSTED:
-        return {"running": False, "hosted": True, "ai_enabled": bool(os.environ.get("XAI_API_KEY"))}
+        return {"running": False, "hosted": True, "ai_enabled": llm_configured()}
     running = AgentState.is_running()
     exit_code = None
     if AgentState.proc is not None and not running:
@@ -311,7 +411,7 @@ def agent_status():
         "mode": AgentState.mode,
         "jobs": AgentState.jobs,
         "queue_done": AgentState.queue_done,
-        "ai_enabled": bool(os.environ.get("XAI_API_KEY")),
+        "ai_enabled": llm_configured(),
         "log_tail": "\n".join(list(AgentState.tail)[-60:]),
     }
 

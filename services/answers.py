@@ -14,8 +14,8 @@ import re
 from datetime import date
 from typing import Any, Optional
 
-import chat
-from supa import admin_config, db
+import routes.chat as chat
+from services.supa import admin_config, db
 
 MAX_PAST = 80
 

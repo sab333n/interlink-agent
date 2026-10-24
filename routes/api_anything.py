@@ -18,7 +18,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from auth import require_user
+from services.auth import require_user
 
 router = APIRouter(prefix="/api/anything")
 BIN = os.getenv("API_ANYTHING_BIN", "").strip() or shutil.which("api-anything") or "api-anything"

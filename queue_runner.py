@@ -618,8 +618,8 @@ async def process(context, job: dict) -> tuple[str, str, Page | None]:
 async def main() -> None:
     jobs = json.loads(Path(os.environ["JOBS_PATH"]).read_text(encoding="utf-8"))
     print(f"Auto-apply queue: {len(jobs)} job(s). Review mode — nothing is submitted.")
-    if not os.getenv("XAI_API_KEY"):
-        print("  ! XAI_API_KEY not set — open-ended questions will be left blank for you.")
+    if not agent.llm_configured():
+        print("  ! No LLM key set (GROQ/GEMINI/OPENAI/XAI) — open-ended questions will be left blank for you.")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(

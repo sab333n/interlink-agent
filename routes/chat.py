@@ -26,8 +26,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from auth import require_user
-import email_finder
+from services.auth import require_user
+from services.posthog_client import get_posthog_client
+import routes.email_finder as email_finder
 
 router = APIRouter(prefix="/api/chat")
 
@@ -267,9 +268,15 @@ async def chat_config(_: str = Depends(require_user)) -> dict[str, Any]:
 
 
 @router.post("")
-async def chat(req: ChatRequest, _: str = Depends(require_user)):
+async def chat(
+    req: ChatRequest,
+    _: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     cfg = llm_config()
     if cfg is None:
         raise HTTPException(503, "No model API key configured on the agent server.")
+    if posthog_client:
+        posthog_client.capture("chat_message_sent", properties={"turn_count": len(req.messages)})
     return StreamingResponse(stream_reply(req, cfg), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})

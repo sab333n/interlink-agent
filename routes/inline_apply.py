@@ -23,9 +23,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from pydantic import BaseModel
 
-import answers
+import services.answers as answers
 import queue_runner as qr
-from auth import require_user
+from services.auth import require_user
+from services.posthog_client import get_posthog_client
 
 router = APIRouter(prefix="/api/apply")
 
@@ -57,6 +58,7 @@ class Session:
         self.resume_name = ""
         self.task: Optional[asyncio.Task[None]] = None
         self.learn: list[tuple[str, str]] = []
+        self.submission_captured = False
 
     def public(self) -> dict:
         return {
@@ -717,19 +719,38 @@ async def close_session(sid: str) -> None:
 
 
 @router.post("/start")
-async def start(req: StartRequest, user: str = Depends(require_user)):
+async def start(
+    req: StartRequest,
+    user: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     resume = base64.b64decode(req.resume_b64) if req.resume_b64 else None
     s = await open_session(req.job, req.profile, resume, req.resume_name, user)
+    if posthog_client:
+        posthog_client.capture("application_started", properties={"has_resume": bool(resume)})
     return s.public()
 
 
 @router.get("/{sid}")
-async def status(sid: str, user: str = Depends(require_user)):
-    return _owned(sid, user).public()
+async def status(
+    sid: str,
+    user: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
+    s = _owned(sid, user)
+    if s.status == "submitted" and not s.submission_captured and posthog_client:
+        posthog_client.capture("application_submitted")
+        s.submission_captured = True
+    return s.public()
 
 
 @router.post("/{sid}/submit")
-async def submit(sid: str, req: SubmitRequest, user: str = Depends(require_user)):
+async def submit(
+    sid: str,
+    req: SubmitRequest,
+    user: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     s = _owned(sid, user)
     if not s.page:
         raise HTTPException(404, "session not found")
@@ -737,6 +758,8 @@ async def submit(sid: str, req: SubmitRequest, user: str = Depends(require_user)
         raise HTTPException(409, f"can't submit while {s.status}")
     asyncio.create_task(_submit(s, req.answers))
     s.status = "submitting"
+    if posthog_client:
+        posthog_client.capture("application_submission_requested")
     return s.public()
 
 

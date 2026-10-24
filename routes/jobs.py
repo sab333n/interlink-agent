@@ -11,10 +11,11 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from auth import require_user
-import freehire
-import jobs_ingest
-import match_score
+from services.auth import require_user
+from services.posthog_client import get_posthog_client
+import services.freehire as freehire
+import services.jobs_ingest as jobs_ingest
+import services.match_score as match_score
 
 router = APIRouter(prefix="/api/jobs")
 
@@ -91,8 +92,13 @@ def jobs_health():
 
 
 @router.post("/refresh")
-def refresh(_user_id: str = Depends(require_user)):
+def refresh(
+    _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     result = jobs_ingest.refresh_jobs(force=True)
+    if posthog_client:
+        posthog_client.capture("jobs_catalogue_refreshed", properties={"job_count": result["count"]})
     return {
         "ok": True,
         "count": result["count"],
@@ -116,7 +122,11 @@ def _merge_jobs(*batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 @router.post("/recommend")
-def recommend(req: RecommendRequest, _user_id: str = Depends(require_user)):
+def recommend(
+    req: RecommendRequest,
+    _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     if req.refresh or not jobs_ingest._cache.get("jobs"):
         jobs_ingest.refresh_jobs(force=req.refresh)
     jobs = jobs_ingest.get_cached_jobs()
@@ -187,6 +197,17 @@ def recommend(req: RecommendRequest, _user_id: str = Depends(require_user)):
         })
     scored.sort(key=lambda x: (-(x["rank_score"] or 0), x["job"].get("postedDaysAgo", 99)))
     top = scored[: max(1, min(req.limit, 100))]
+    if posthog_client:
+        posthog_client.capture(
+            "job_recommendations_generated",
+            properties={
+                "recommendation_count": len(top),
+                "internships_only": req.internships_only,
+                "sponsors_only": req.sponsors_only,
+                "remote_only": req.remote_only,
+                "fresh_only": req.fresh_only,
+            },
+        )
     return {
         "ok": True,
         "count": len(top),
@@ -198,7 +219,11 @@ def recommend(req: RecommendRequest, _user_id: str = Depends(require_user)):
 
 
 @router.post("/search")
-def freehire_search(req: FreehireSearchRequest, _user_id: str = Depends(require_user)):
+def freehire_search(
+    req: FreehireSearchRequest,
+    _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     """Live faceted search against freehire (keyless public catalogue)."""
     filters: dict[str, Any] = {
         "countries": req.countries,
@@ -220,13 +245,23 @@ def freehire_search(req: FreehireSearchRequest, _user_id: str = Depends(require_
     if req.visa_sponsorship is not None:
         filters["visa_sponsorship"] = req.visa_sponsorship
     try:
-        return freehire.search(
+        result = freehire.search(
             q=req.q,
             limit=req.limit,
             offset=req.offset,
             agent=req.agent,
             **filters,
         )
+        if posthog_client:
+            posthog_client.capture(
+                "job_search_completed",
+                properties={
+                    "result_count": len(result.get("jobs") or []),
+                    "has_filters": any(value is not None for value in filters.values()),
+                    "agent_search": req.agent,
+                },
+            )
+        return result
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"freehire search failed: {e}") from e
 
@@ -280,17 +315,27 @@ def freehire_similar(
 
 
 @router.post("/market-fit")
-def market_fit(req: MarketFitRequest, _user_id: str = Depends(require_user)):
+def market_fit(
+    req: MarketFitRequest,
+    _user_id: str = Depends(require_user),
+    posthog_client=Depends(get_posthog_client),
+):
     """Skill coverage vs freehire catalogue (public facets proxy for market/coverage)."""
     if not req.skills:
         raise HTTPException(status_code=400, detail="skills required")
     try:
-        return freehire.market_fit(
+        result = freehire.market_fit(
             req.skills,
             countries=req.countries,
             category=req.category,
             seniority=req.seniority,
         )
+        if posthog_client:
+            posthog_client.capture(
+                "market_fit_generated",
+                properties={"skill_count": len(req.skills), "has_category_filter": bool(req.category)},
+            )
+        return result
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
