@@ -761,6 +761,12 @@ async def _dropdown_grok_fallback(page: Page, btn, label: str) -> str:
     return ""
 
 
+def _profile_yes_no(key: str) -> str | None:
+    """"Yes" / "No" from a profile field; None when it's blank, so the applicant answers."""
+    value = str(PROFILE.get(key) or "").strip().lower()
+    return "Yes" if value.startswith("y") else "No" if value.startswith("n") else None
+
+
 def decide_yes_no(question: str) -> str | None:
     """Decide Yes/No for common application questions based on PROFILE.
 
@@ -797,7 +803,7 @@ def decide_yes_no(question: str) -> str | None:
             "right to work",
         ]
     ):
-        return "Yes" if str(PROFILE.get("work_auth", "Yes")).lower().startswith("y") else "No"
+        return _profile_yes_no("work_auth")
 
     # Sponsorship → No (or profile)
     if any(
@@ -809,11 +815,11 @@ def decide_yes_no(question: str) -> str | None:
             "will you now or in the future require",
         ]
     ):
-        return "Yes" if str(PROFILE.get("sponsorship", "No")).lower().startswith("y") else "No"
+        return _profile_yes_no("sponsorship")
 
     # Relocation
     if "relocate" in q or "willing to relocate" in q:
-        return "Yes" if str(PROFILE.get("relocation", "Yes")).lower().startswith("y") else "No"
+        return _profile_yes_no("relocation")
 
     # 18 years or older
     if "18 years" in q or "at least 18" in q or "of legal age" in q:

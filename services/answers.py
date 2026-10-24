@@ -163,16 +163,21 @@ def _pick_yes_no(opts: list[str], yn: str) -> Optional[str]:
     return next((o for o in opts if re.search(rf"\b{yn}\b", o, re.I)), None)
 
 
+def _yn(value: Any) -> Optional[str]:
+    v = str(value or "").strip().lower()
+    return "yes" if v.startswith("y") else "no" if v.startswith("n") else None
+
+
 def _yn_from_profile(q: str, profile: dict[str, Any]) -> Optional[str]:
     visa = str(profile.get("visa_status", "")).lower()
+    # Blank profile fields stay unanswered: a wrong "No" on work authorization can auto-reject.
     if re.search(r"sponsor|h-?1b|immigration", q):
-        return "yes" if str(profile.get("sponsorship", "")).lower().startswith("y") else "no"
+        return _yn(profile.get("sponsorship"))
     if re.search(r"authori[sz]ed|lawfully|eligible to work|legally (authori|able)|right to work", q):
-        auth = str(profile.get("work_auth", "yes")).lower()
-        return "no" if auth in ("no", "n") or "not authorized" in auth else "yes"
+        auth = str(profile.get("work_auth") or "").strip().lower()
+        return "no" if "not authorized" in auth else _yn(auth)
     if re.search(r"willing to work|work from the office|in.?office|on.?site|hybrid|relocat", q):
-        rel = str(profile.get("relocation", "yes")).lower()
-        return "no" if rel.startswith("n") else "yes"
+        return _yn(profile.get("relocation"))
     if re.search(r"optional practical|stem\s*opt|\bopt\b|\bcpt\b|f-1", q):
         if re.search(r"f-1|cpt|opt|stem", visa):
             return "yes"

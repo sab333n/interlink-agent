@@ -116,11 +116,11 @@ def question_answer(label: str) -> str | None:
     if re.search(r"relatives?|family member|close personal relationship", q) and re.search(r"employ|work", q):
         return "No"
     if re.search(r"sponsor|h-?1b", q):
-        return yes_no(PROFILE.get("sponsorship", "")) or "No"
+        return yes_no(PROFILE.get("sponsorship", ""))
     if re.search(r"authori[sz]ed to work|lawfully|eligible to work|legally (authori|able)|right to work", q):
-        return yes_no(PROFILE.get("work_auth", "")) or "Yes"
+        return yes_no(PROFILE.get("work_auth", ""))
     if re.search(r"willing to work|work from the office|in.?office|on.?site", q):
-        return yes_no(PROFILE.get("relocation", "")) or "Yes"
+        return yes_no(PROFILE.get("relocation", ""))
     if re.search(r"optional practical|\bopt\b|stem\s*opt|\bcpt\b", q):
         if re.search(r"f-1|cpt|opt|stem", visa):
             return "Yes"
