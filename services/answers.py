@@ -91,8 +91,17 @@ async def remember(user_id: str, company: str, pairs: list[tuple[str, str]]) -> 
     """Saves the user's answers to non-standard questions so the next form can reuse them."""
     if not pairs or not admin_config() or not re.fullmatch(r"[0-9a-f-]{36}", user_id or ""):
         return
-    rows = [{"user_id": user_id, "question": question_key(q, company), "answer": a[:2000]}
-            for q, a in pairs if q.strip() and a.strip()]
+    by_key: dict[str, dict[str, str]] = {}
+    for q, a in pairs:
+        if not (q.strip() and a.strip()):
+            continue
+        # The {company} form lets the model adapt answers to other employers; the exact form
+        # is reused verbatim when the same question comes back (e.g. on the employer's own site).
+        for key in (question_key(q, company), question_key(q, "")):
+            by_key[key] = {"user_id": user_id, "question": key, "answer": a[:2000]}
+    rows = list(by_key.values())
+    if not rows:
+        return
     try:
         await db("POST", "apply_answers?on_conflict=user_id,question", rows,
                  prefer="resolution=merge-duplicates")
@@ -363,6 +372,19 @@ async def suggest(fields: list[dict[str, Any]], job: dict[str, Any], profile: di
         return {}
     past = await load_past(user_id)
     out: dict[str, dict[str, str]] = {}
+
+    # Exact questions the user already answered (no {company} placeholder) are reused as-is,
+    # even ones only the applicant can answer, and even without a model.
+    exact = {str(p.get("question")): str(p.get("answer") or "") for p in past
+             if "{company}" not in str(p.get("question"))}
+    for f in blank:
+        hit = exact.get(question_key(f["label"], ""))
+        answer = _clean(f, hit) if hit else None
+        if answer is not None:
+            out[f["id"]] = {"answer": answer, "source": "past"}
+    blank = [f for f in blank if f["id"] not in out]
+    if not blank:
+        return out
     by_id = {f["id"]: f for f in blank}
 
     if cfg:

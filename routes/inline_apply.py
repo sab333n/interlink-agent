@@ -213,6 +213,20 @@ def _real_choice(value: str, options: list[str]) -> Optional[str]:
     return text
 
 
+def reviewed_pairs(fields: list[dict[str, Any]], answers_in: dict[str, str]) -> list[tuple[str, str]]:
+    """(question label, answer) for every real answer the user reviewed, keyed by field id."""
+    by_id = {f["id"]: f for f in fields}
+    pairs: list[tuple[str, str]] = []
+    for fid, value in answers_in.items():
+        f = by_id.get(fid)
+        if not f or f.get("kind") == "file" or not f.get("label"):
+            continue
+        choice = _real_choice(value, f.get("options") or [])
+        if choice is not None:
+            pairs.append((f["label"], {"true": "yes"}.get(choice, choice)))
+    return pairs
+
+
 async def _refresh_select_options(page: Page, fields: list[dict[str, Any]]) -> None:
     """Open each blank select/combobox once so Greenhouse react-select options are known."""
     for f in fields:
@@ -762,6 +776,16 @@ async def submit(
     if posthog_client:
         posthog_client.capture("application_submission_requested")
     return s.public()
+
+
+@router.post("/{sid}/remember")
+async def remember_reviewed(sid: str, req: SubmitRequest, user: str = Depends(require_user)):
+    """Saves reviewed answers before the user leaves for the employer's own site, so the
+    InterLink extension fills that form with the same answers."""
+    s = _owned(sid, user)
+    pairs = reviewed_pairs(s.fields, req.answers)
+    await answers.remember(s.owner, s.job.get("company", ""), pairs)
+    return {"ok": True, "saved": len(pairs)}
 
 
 @router.post("/{sid}/cancel")

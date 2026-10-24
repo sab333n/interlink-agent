@@ -190,5 +190,105 @@ class SuggestWithoutModelTest(unittest.TestCase):
         self.assertEqual(out, {"name": {"answer": "Sabin", "source": "fact"}})
 
 
+USER = "0b9f3c2e-1a2b-4c5d-8e9f-001122334455"
+DUOLINGO = {"company": "Duolingo", "role": "Data Scientist, Intern"}
+REVIEW_FIELDS = [
+    field("r", "Resume", "file"),
+    field("pron", "How do you pronounce your name? (e.g., 'An-na' or 'Ah-na')"),
+    field("gpa", "Undergraduate GPA"),
+    field("acct", "Do you have a Duolingo account? If yes, what is your username?"),
+    field("why", "Why are you interested in Duolingo?", "textarea"),
+    field("fel", "Have you ever been convicted of a felony?", "select", options=["Yes", "No"]),
+]
+
+
+class ReviewedPairsTest(unittest.TestCase):
+    def test_keeps_real_answers_by_label(self):
+        pairs = inline_apply.reviewed_pairs(REVIEW_FIELDS, {
+            "r": "resume.pdf", "pron": "SAH-bin", "gpa": "3.7", "acct": " ", "why": "Select…",
+            "fel": "no", "unknown": "x",
+        })
+        self.assertEqual(pairs, [
+            ("How do you pronounce your name? (e.g., 'An-na' or 'Ah-na')", "SAH-bin"),
+            ("Undergraduate GPA", "3.7"),
+            ("Have you ever been convicted of a felony?", "No"),
+        ])
+
+
+class HandOffTest(unittest.TestCase):
+    """Answers reviewed in InterLink come back verbatim when the extension fills the employer's form."""
+
+    def remember(self, pairs, company="Duolingo"):
+        saved = []
+
+        async def fake_db(method, path, body=None, prefer=""):
+            saved.extend(body)
+
+        with mock.patch.object(answers, "admin_config", return_value=("https://db", "key")), \
+                mock.patch.object(answers, "db", side_effect=fake_db):
+            asyncio.run(answers.remember(USER, company, pairs))
+        return saved
+
+    def test_remember_stores_exact_and_company_neutral_keys(self):
+        rows = self.remember([("Why are you interested in Duolingo?", "Because...")])
+        self.assertEqual({r["question"] for r in rows},
+                         {"why are you interested in {company}?", "why are you interested in duolingo?"})
+        self.assertEqual(self.remember([("  ", "x"), ("GPA", " ")]), [])
+
+    def test_exact_answers_are_reused_without_a_model(self):
+        rows = self.remember(inline_apply.reviewed_pairs(REVIEW_FIELDS, {
+            "pron": "SAH-bin", "gpa": "3.7", "acct": "No", "why": "I build data tools for learners.", "fel": "No",
+        }))
+
+        async def past(_user):
+            return [{"question": r["question"], "answer": r["answer"]} for r in rows]
+
+        employer_form = [
+            field("e1", "How do you pronounce your name? (e.g., 'An-na' or 'Ah-na') *"),
+            field("e2", "Undergraduate GPA"),
+            field("e3", "Do you have a Duolingo account? If yes, what is your username?"),
+            field("e4", "Why are you interested in Duolingo?", "textarea"),
+            field("e5", "Have you ever been convicted of a felony?", "select", options=["Yes", "No"]),
+        ]
+        with mock.patch.object(answers, "load_past", side_effect=past):
+            out = asyncio.run(answers.suggest(employer_form, DUOLINGO, {**agent._PROFILE_DEFAULTS}, USER))
+        self.assertEqual({k: v["answer"] for k, v in out.items()}, {
+            "e1": "SAH-bin", "e2": "3.7", "e3": "No", "e4": "I build data tools for learners.", "e5": "No",
+        })
+        self.assertTrue(all(v["source"] == "past" for v in out.values()))
+
+    def test_company_specific_answers_are_not_copied_to_other_employers(self):
+        rows = self.remember([("Why are you interested in Duolingo?", "Duolingo's mission...")])
+
+        async def past(_user):
+            return rows
+
+        with mock.patch.object(answers, "load_past", side_effect=past):
+            out = asyncio.run(answers.suggest([field("w", "Why are you interested in Stripe?", "textarea")],
+                                              {"company": "Stripe"}, {**agent._PROFILE_DEFAULTS}, USER))
+        self.assertEqual(out, {})
+
+    def test_extension_fill_returns_the_saved_answers(self):
+        from routes import extension
+
+        rows = self.remember([("Undergraduate GPA", "3.7"), ("Do you have a Duolingo account? If yes, what is your username?", "No")])
+
+        async def past(_user):
+            return rows
+
+        async def info(_user):
+            return {"profile": {"first_name": "Sabin"}}
+
+        req = extension.FillRequest(fields=[
+            extension.Field(id="a", kind="input", label="First Name", required=True),
+            extension.Field(id="b", kind="input", label="Undergraduate GPA *", required=True),
+            extension.Field(id="c", kind="input", label="Do you have a Duolingo account? If yes, what is your username?", required=True),
+        ], job=DUOLINGO)
+        with mock.patch.object(answers, "load_past", side_effect=past), \
+                mock.patch.object(extension, "_apply_info", side_effect=info):
+            out = asyncio.run(extension.fill(req, user=USER))["answers"]
+        self.assertEqual({k: v["answer"] for k, v in out.items()}, {"a": "Sabin", "b": "3.7", "c": "No"})
+
+
 if __name__ == "__main__":
     unittest.main()
