@@ -35,6 +35,15 @@ def _llm() -> OpenAI | None:
     return _llm_client
 
 
+# Only the applicant knows these, so no model or rule ever guesses them.
+ASK_USER = re.compile(
+    r"pronounc|\bgpa\b|grade point|\busername\b|\bhandle\b"
+    r"|\b(do|did) you (have|own|use)\b.{0,40}\baccount\b"
+    r"|convicted|felony|misdemeanor|criminal",
+    re.I,
+)
+
+
 def llm_configured() -> bool:
     return any(os.getenv(env_key, "").strip() for env_key, _, _ in LLM_PROVIDERS)
 
@@ -77,8 +86,27 @@ _PROFILE_DEFAULTS = {
     "projects": [], "leadership": [], "honors": [], "availability": "",
     "remote_preference": "", "ats_account_password": "",
 }
+_SOCIAL_ROOTS = {
+    "x.com", "twitter.com", "linkedin.com", "github.com", "facebook.com",
+    "instagram.com", "tiktok.com", "youtube.com", "medium.com",
+}
+
+
+def personal_site(url: str) -> str:
+    """The URL if it can be a personal site; "" for junk like a bare "x.com"."""
+    u = str(url or "").strip()
+    if not u or " " in u:
+        return ""
+    host, _, path = re.sub(r"^https?://", "", u, flags=re.I).partition("/")
+    host = host.lower().removeprefix("www.")
+    if "." not in host or (host in _SOCIAL_ROOTS and not path.strip("/")):
+        return ""
+    return u
+
+
 _PROFILE_RAW = json.loads(_PROFILE_FILE.read_text(encoding="utf-8")) if _PROFILE_FILE.exists() else {}
 PROFILE = {**_PROFILE_DEFAULTS, **{k: v for k, v in _PROFILE_RAW.items() if v is not None}}
+PROFILE["portfolio"] = personal_site(PROFILE["portfolio"])
 
 _RESUME_ENV = os.environ.get("RESUME_PATH", "").strip()
 RESUME_CANDIDATES = (
@@ -178,6 +206,8 @@ WORKDAY_PRIORITY_FIELD_SPECS = [
 
 def ask_grok(question: str, context: str = "") -> str:
     """Ask Grok a question about how to fill a form field."""
+    if ASK_USER.search(question):
+        return ""
     prompt = f"""You are helping autofill a job application form.
 
 USER PROFILE:
@@ -736,6 +766,8 @@ def decide_yes_no(question: str) -> str | None:
 
     Returns "Yes", "No", or None if we shouldn't auto-answer.
     """
+    if ASK_USER.search(question):
+        return None
     q = question.lower()
 
     # Prior-employment questions → No (you're applying fresh)
@@ -787,9 +819,6 @@ def decide_yes_no(question: str) -> str | None:
     if "18 years" in q or "at least 18" in q or "of legal age" in q:
         return "Yes"
 
-    # Criminal record / felony — default No
-    if any(k in q for k in ["convicted", "felony", "criminal record"]):
-        return "No"
 
     # Non-compete / NDA with current employer
     if "non-compete" in q or "non compete" in q or "nda" in q:

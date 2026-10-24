@@ -104,6 +104,7 @@ def question_answer(label: str) -> str | None:
     """Answers for full-sentence questions, where short-field lookups would misfire."""
     q = label.lower()
     visa = str(PROFILE.get("visa_status", "")).lower()
+    grad = str(PROFILE.get("graduation_year", ""))
     if re.search(r"\bcpt\b|\bopt\b|f-1|curricular practical|optional practical", q):
         if not visa:
             return None
@@ -141,7 +142,6 @@ def question_answer(label: str) -> str | None:
         return "Online job board"
     if re.search(r"years of .{0,20}experience", q):
         return str(PROFILE.get("years_experience", "")) or None
-    grad = str(PROFILE.get("graduation_year", ""))
     if re.search(r"currently enrolled|currently a student|currently pursuing", q) and not re.search(r"what|which|when|where|how", q):
         return "Yes" if grad.isdigit() and int(grad) >= date.today().year else None
     if re.search(r"(what|which).{0,40}degree", q):
@@ -164,6 +164,8 @@ def answer_for(label: str) -> str | None:
 
 
 def ai_answer(label: str, job: dict, options: list[str] | None = None, long: bool = False) -> str:
+    if agent.ASK_USER.search(label):
+        return ""
     public_profile = {k: v for k, v in PROFILE.items() if k != "ats_account_password"}
     if options:
         instructions = (

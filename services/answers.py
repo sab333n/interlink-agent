@@ -15,6 +15,7 @@ from datetime import date
 from typing import Any, Optional
 
 import routes.chat as chat
+from agent import ASK_USER  # questions answered only from past answers or profile facts
 from services.supa import admin_config, db
 
 MAX_PAST = 80
@@ -28,7 +29,11 @@ For each question return {"id", "answer", "source"}:
 - "past": reuse a past answer (swap the company name when needed).
 - "draft": open-ended / essay / "why us" / "tell us about" / cover letter. Write 3-5 specific
   first-person sentences grounded in FACTS (skills, projects, school). No fluff, no exclamation marks,
-  no greeting or sign-off. ALWAYS draft these — never leave them blank.
+  no greeting or sign-off. ALWAYS draft these — never leave them blank. Each essay must answer its
+  own question; never give two questions the same text. Mention only experiences in FACTS — no
+  invented upbringing, languages or anecdotes.
+- Omit GPA, name pronunciation, and accounts/usernames on the company's own product unless FACTS or
+  PAST ANSWERS contain them. The applicant fills those in themselves.
 - For OPTIONS / checkboxes / radios: copy the option text EXACTLY. For multi-select checkboxes,
   return a comma-separated list of the options to check.
 - Prefer answering over leaving blank. Only return null for questions you truly cannot answer
@@ -43,6 +48,25 @@ For each question return {"id", "answer", "source"}:
 - Consent / privacy / acknowledge: Yes / Agree / Acknowledge.
 
 Return JSON: {"answers": [...]} — one entry per question you can answer."""
+
+ESSAY_PROMPT = """Write the applicant's answer to ONE open-ended question on a job application.
+
+3-5 specific first-person sentences grounded only in FACTS (skills, projects, experience, school).
+Answer exactly what QUESTION asks, and don't reuse sentences from OTHER ANSWERS.
+Never invent employers, titles, dates, results, languages, upbringing or personal anecdotes:
+mention only experiences that appear in FACTS. No greeting, sign-off or exclamation marks.
+
+Return JSON: {"answer": "..."}"""
+
+PLACEHOLDER = re.compile(r"^\s*(n/?a|none|not (specified|applicable|provided)|-+|tbd|unknown)\s*$", re.I)
+NOT_ESSAY = re.compile(r"if different|preferred name|pronoun|salary|compensation|referral name|employee name", re.I)
+
+
+def _is_essay(field: dict[str, Any]) -> bool:
+    label = field.get("label") or ""
+    if field.get("options") or NOT_ESSAY.search(label) or ASK_USER.search(label):
+        return False
+    return field["kind"] == "textarea" or (field["kind"] in ("text", "input") and (len(label) > 80 or "?" in label))
 
 
 def question_key(label: str, company: str) -> str:
@@ -156,8 +180,6 @@ def _yn_from_profile(q: str, profile: dict[str, Any]) -> Optional[str]:
             return "no"
         # Unknown visa — default No so the form isn't blocked; user can edit.
         return "no"
-    if re.search(r"duolingo account", q):
-        return "no"
     return None
 
 
@@ -169,8 +191,6 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
     kind = field["kind"]
     skills = _skills(profile)
     grad = str(profile.get("graduation_year") or "")
-    company = job.get("company") or "the company"
-    role = job.get("role") or "this role"
     loc = str(job.get("location") or "")
 
     # Short profile fields (Greenhouse often leaves these blank until suggest).
@@ -184,12 +204,11 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
             (r"linkedin", profile.get("linkedin")),
             (r"github", profile.get("github")),
             (r"website|portfolio|personal site", profile.get("portfolio") or profile.get("github")),
-            (r"undergraduate gpa|college gpa|\bgpa\b", profile.get("gpa") or "N/A"),
-            (r"pronounce your name|pronunciation", profile.get("first_name")),
+            (r"undergraduate gpa|college gpa|\bgpa\b", profile.get("gpa")),
             (r"end date year|graduation year|to year", grad),
         ]
         for pattern, value in table:
-            if value and re.search(pattern, q):
+            if value and not PLACEHOLDER.match(str(value)) and re.search(pattern, q):
                 return {"answer": str(value), "source": "fact"}
 
     if kind == "checkbox" and re.search(r"agree|acknowledge|certify|confirm|consent|privacy", q):
@@ -291,12 +310,6 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
         else:
             return {"answer": yn.capitalize(), "source": "fact"}
 
-    if opts and re.search(r"\b(yes|no)\b", " ".join(opts).lower()) and len(opts) <= 8:
-        yn2 = yn or "yes"
-        hit = _pick_yes_no(opts, yn2)
-        if hit:
-            return {"answer": hit, "source": "fact"}
-
     if opts and re.search(r"degree|bachelor|master", q):
         degree = str(profile.get("degree_full") or profile.get("degree") or "")
         if degree:
@@ -304,26 +317,36 @@ def _fallback(field: dict[str, Any], job: dict[str, Any], profile: dict[str, Any
             if hit:
                 return {"answer": hit, "source": "fact"}
 
-    if kind in ("textarea",) or (kind in ("text", "input") and (len(label) > 80 or "?" in label)):
-        if re.search(r"if different|preferred name|pronoun|salary|compensation|referral name|employee name", q):
-            return None
-        if re.search(r"duolingo account|username", q):
-            return {"answer": "No", "source": "fact"}
-        exp = (profile.get("work_experience") or [{}])
-        latest = exp[0] if isinstance(exp, list) and exp else {}
-        proof = (latest.get("description") or profile.get("skills_summary") or "").strip()
-        if not proof and not profile.get("university"):
-            return None
-        draft = (
-            f"I'm excited about {role} at {company} because it lines up with the work I've already done. "
-            f"{proof[:280].rstrip('.')}. "
-            f"I'm currently studying {profile.get('major') or 'computer science'} at "
-            f"{profile.get('university') or 'university'} "
-            f"(class of {grad or 'soon'}) and want to ship real systems with your team."
-        )
-        return {"answer": re.sub(r"\s+", " ", draft).strip(), "source": "draft"}
-
+    # Essays are drafted by the model, one per question (see _draft_essays); no canned text.
     return None
+
+
+async def _draft_essays(fields: list[dict[str, Any]], job: dict[str, Any], facts: dict[str, Any],
+                        cfg: dict[str, str], out: dict[str, dict[str, str]]) -> None:
+    """Drafts each still-blank essay with its own model call, so every answer fits its question."""
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=cfg["key"], base_url=cfg["base"])
+    for f in fields:
+        others = [v["answer"] for v in out.values() if v["source"] == "draft"]
+        try:
+            res = await client.chat.completions.create(
+                model=cfg["model"], temperature=0.4, max_tokens=1500,
+                response_format={"type": "json_object"},
+                extra_body={"reasoning_effort": "low"} if "gpt-oss" in cfg["model"] else None,
+                messages=[
+                    {"role": "system", "content": ESSAY_PROMPT},
+                    {"role": "user", "content": json.dumps({
+                        "company": job.get("company"), "role": job.get("role"), "QUESTION": f["label"][:600],
+                        "FACTS": facts, "OTHER ANSWERS": others,
+                    }, ensure_ascii=False)[:20000]},
+                ])
+            answer = str(json.loads(res.choices[0].message.content or "{}").get("answer") or "").strip()
+        except Exception as e:
+            print(f"[answers] essay draft failed: {str(e)[:200]}", flush=True)
+            continue
+        if answer and answer not in others:
+            out[f["id"]] = {"answer": answer, "source": "draft"}
 
 
 async def suggest(fields: list[dict[str, Any]], job: dict[str, Any], profile: dict[str, Any],
@@ -362,11 +385,24 @@ async def suggest(fields: list[dict[str, Any]], job: dict[str, Any], profile: di
                 source = item.get("source")
                 if not f or source not in ("fact", "past", "draft"):
                     continue
+                if ASK_USER.search(f["label"]) and source != "past":
+                    continue
                 answer = _clean(f, item.get("answer"))
                 if answer is not None:
                     out[f["id"]] = {"answer": answer, "source": source}
         except Exception as e:
             print(f"[answers] suggest failed: {str(e)[:200]}", flush=True)
+
+        # Essays with no answer or a copy of another essay get their own draft.
+        essays = [f for f in blank if _is_essay(f)]
+        seen: set[str] = set()
+        for f in essays:
+            hint = out.get(f["id"])
+            if hint and hint["source"] != "past" and hint["answer"] in seen:
+                out.pop(f["id"])
+            elif hint:
+                seen.add(hint["answer"])
+        await _draft_essays([f for f in essays if f["id"] not in out], job, facts, cfg, out)
 
     for f in blank:
         if f["id"] in out:

@@ -137,6 +137,7 @@ def _use_profile(profile: dict, resume: Optional[Path]) -> None:
     qr.PROFILE.clear()
     qr.PROFILE.update(qr.agent._PROFILE_DEFAULTS)
     qr.PROFILE.update({k: v for k, v in profile.items() if v is not None})
+    qr.PROFILE["portfolio"] = qr.agent.personal_site(qr.PROFILE.get("portfolio", ""))
     qr.agent.RESUME_CANDIDATES[:] = [resume] if resume else []
 
 
